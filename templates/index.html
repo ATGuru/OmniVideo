@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OmniVideo</title>
+<link rel="stylesheet" href="/static/style.css?v=9">
+</head>
+<body>
+<header>
+  <h1>OmniVideo</h1>
+  <p id="project-title">No song loaded</p>
+  <div class="header-actions">
+    <button id="save-btn" type="button">Save</button>
+    <button id="settings-btn" type="button">API key</button>
+  </div>
+</header>
+<p id="status" class="status" role="status"></p>
+
+<div class="workspace">
+  <aside class="col" id="col-source">
+    <div id="upload-box" class="upload-box">
+      <p class="upload-kicker">Song</p>
+      <p id="song-label">Drop a song here, or choose a file</p>
+      <input id="song-file" type="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac">
+      <button id="choose-btn" type="button">Choose file</button>
+    </div>
+
+    <div class="col-head">
+      <h2>Lyrics</h2>
+      <button id="transcribe-btn" type="button">Transcribe</button>
+    </div>
+    <p id="lyrics-note" class="note">Load a song, then transcribe.</p>
+    <div id="lyrics" class="lyrics"></div>
+    <div id="selection-bar" class="selection-bar" hidden draggable="true">
+      <span id="selection-label"></span>
+      <span class="drag-hint">Drag to the timeline</span>
+    </div>
+  </aside>
+
+  <main class="col" id="col-work">
+    <div class="work-scroll">
+      <div class="col-head">
+        <h2>Timeline</h2>
+      </div>
+      <p class="note">Highlight lyrics on the left and drop them here. Each card is one shot: the words, the prompt, and a regenerate.</p>
+      <div id="board" class="board">
+        <div id="timeline"></div>
+        <p id="drop-hint" class="drop-hint">Drop a lyric selection here</p>
+      </div>
+    </div>
+    <section class="reel" id="reel" aria-label="Frames">
+      <div class="col-head">
+        <h2>Frames</h2>
+        <div class="header-actions">
+          <button id="upload-stills-btn" type="button">Upload stills</button>
+          <button id="generate-btn" type="button">Generate images</button>
+        </div>
+      </div>
+      <p id="reel-note" class="note"></p>
+      <div id="still-bin" class="still-bin" hidden>
+        <p class="note">Your stills. Drag one onto a frame.</p>
+        <div id="still-bin-scroller" class="reel-scroller"></div>
+      </div>
+      <div id="reel-scroller" class="reel-scroller"></div>
+      <input id="still-file" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" multiple>
+    </section>
+  </main>
+
+  <aside class="col" id="col-master">
+    <h2>Master</h2>
+    <label for="feel">Overall feel</label>
+    <textarea id="feel" rows="4" placeholder="Mood, light, palette, camera distance"></textarea>
+
+    <div class="col-head">
+      <h3>Characters</h3>
+      <button id="add-character" type="button">Add</button>
+    </div>
+    <div id="cast"></div>
+
+    <label for="master-prompt">Master prompt</label>
+    <textarea id="master-prompt" rows="5" placeholder="Locked into every shot, along with that shot's own prompt"></textarea>
+  </aside>
+</div>
+
+<div id="settings-modal" class="modal" style="display:none;">
+  <div class="modal-content">
+    <h3>API key</h3>
+    <p class="note">A key already on this machine is used. Paste one here only to replace it.</p>
+    <label for="api-key">xAI API Key</label>
+    <input type="password" id="api-key" autocomplete="off">
+    <div class="modal-actions">
+      <button id="save-key" type="button">Save</button>
+      <button id="close-settings" type="button">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="frame-modal" class="modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="frame-title">
+  <div class="modal-content frame-dialog">
+    <div class="col-head">
+      <h3 id="frame-title">Frame</h3>
+      <button id="close-frame" type="button" class="text-btn">Close</button>
+    </div>
+    <div id="frame-stage" class="frame-stage"></div>
+    <p id="frame-meta" class="note"></p>
+    <p id="frame-lyrics" class="shot-lyrics"></p>
+    <label for="frame-prompt">Prompt</label>
+    <textarea id="frame-prompt" rows="5" placeholder="Prompt for this image"></textarea>
+    <p id="frame-sent" class="note"></p>
+    <div class="modal-actions">
+      <button id="frame-upload" type="button">Use a still</button>
+      <button id="frame-regen" type="button">Regenerate</button>
+    </div>
+    <p id="frame-status" class="shot-status"></p>
+  </div>
+</div>
+
+<script src="/static/app.js?v=12"></script>
+</body>
+</html>
