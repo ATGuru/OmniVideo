@@ -67,36 +67,23 @@ class BoardScreen extends StatefulWidget {
 
 class _BoardScreenState extends State<BoardScreen> {
   late final BoardController board;
-  final _url = TextEditingController();
-  final _urlFocus = FocusNode();
 
   @override
   void initState() {
     super.initState();
     board = widget.board ?? BoardController();
-    _url.text = board.baseUrl;
     board.addListener(_onBoard);
   }
 
   void _onBoard() {
-    if (!mounted) return;
-    if (!_urlFocus.hasFocus && _url.text != board.baseUrl) {
-      _url.text = board.baseUrl;
-    }
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
     board.removeListener(_onBoard);
     board.dispose();
-    _url.dispose();
-    _urlFocus.dispose();
     super.dispose();
-  }
-
-  Future<void> _commitUrl() async {
-    await board.setBaseUrl(_url.text);
   }
 
   Future<void> _newProject() async {
@@ -150,14 +137,6 @@ class _BoardScreenState extends State<BoardScreen> {
             children: [
               _Header(
                 title: board.title,
-                url: _url,
-                urlFocus: _urlFocus,
-                onUrl: _commitUrl,
-                onConnect: () async {
-                  await _commitUrl();
-                  if (!mounted) return;
-                  await board.connect();
-                },
                 onOpen: _openProject,
                 onNew: _newProject,
                 onSave: board.save,
@@ -195,20 +174,12 @@ class _BoardScreenState extends State<BoardScreen> {
 class _Header extends StatelessWidget {
   const _Header({
     required this.title,
-    required this.url,
-    required this.urlFocus,
-    required this.onUrl,
-    required this.onConnect,
     required this.onOpen,
     required this.onNew,
     required this.onSave,
   });
 
   final String title;
-  final TextEditingController url;
-  final FocusNode urlFocus;
-  final Future<void> Function() onUrl;
-  final Future<void> Function() onConnect;
   final VoidCallback onOpen;
   final VoidCallback onNew;
   final VoidCallback onSave;
@@ -222,18 +193,6 @@ class _Header extends StatelessWidget {
         Expanded(
           child: Text(title, overflow: TextOverflow.ellipsis, style: const TextStyle(color: OmniColors.text)),
         ),
-        SizedBox(
-          width: 210,
-          child: TextField(
-            controller: url,
-            focusNode: urlFocus,
-            style: const TextStyle(color: OmniColors.text, fontSize: 13),
-            decoration: const InputDecoration(hintText: 'http://<tower>:8080'),
-            onSubmitted: (_) => onUrl(),
-            onEditingComplete: onUrl,
-          ),
-        ),
-        TextButton(onPressed: onConnect, child: const Text('Connect')),
         TextButton(onPressed: onOpen, child: const Text('Open')),
         TextButton(onPressed: onNew, child: const Text('New')),
         FilledButton(onPressed: onSave, child: const Text('Save')),

@@ -4,6 +4,9 @@ import 'dart:io';
 
 import 'package:http/http.dart' as http;
 
+/// Desktop OmniVideo board. Android reaches OmniForge by this tailnet address.
+const String kOmniVideoBackend = 'http://100.67.76.16:8080';
+
 class OmniException implements Exception {
   OmniException(this.message, {this.statusCode});
 
@@ -64,7 +67,7 @@ class OmniApi {
 
   Uri uri(String path) {
     if (baseUrl.isEmpty) {
-      throw OmniException('Set the backend address first. Example: http://<tower>:8080');
+      throw OmniException('The backend address is missing.');
     }
     return Uri.parse('$baseUrl$path');
   }
@@ -187,17 +190,4 @@ String readDetail(http.Response res) {
     }
   } catch (_) {}
   return 'Request failed.';
-}
-
-/// Accepts `http://host:8080` or `host:8080`. Returns null when the text is empty or not an HTTP URL.
-String? normalizeBase(String raw) {
-  var text = raw.trim();
-  if (text.isEmpty) return null;
-  if (!text.contains('://')) text = 'http://$text';
-  final uri = Uri.tryParse(text);
-  if (uri == null || uri.host.isEmpty) return null;
-  if (uri.scheme != 'http' && uri.scheme != 'https') return null;
-  var out = uri.toString();
-  if (out.endsWith('/')) out = out.substring(0, out.length - 1);
-  return out;
 }

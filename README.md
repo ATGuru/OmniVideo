@@ -30,7 +30,7 @@ flutter pub get
 flutter run
 ```
 
-In the app, set the backend base URL to the machine running OmniVideo, for example `http://<tower>:8080`. The address is saved on the device. Use a Tailscale name or a local network address, port 8080. The app allows cleartext HTTP so that address can be typed in. Leave the address out of this repository.
+The app calls the desktop board at `http://100.67.76.16:8080`. That address is compiled in, and the screen has no server field. Cleartext HTTP is allowed so the phone can reach it.
 
 Create or open a named project before generating. Those folders are the server's OmniVideo/Projects directory. The existing phone file app can browse them when this branch's server is started with:
 

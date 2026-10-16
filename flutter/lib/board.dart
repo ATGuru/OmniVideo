@@ -4,7 +4,6 @@ import 'package:flutter/foundation.dart';
 
 import 'api.dart';
 import 'placement.dart';
-import 'settings.dart';
 
 class Character {
   Character({this.name = '', this.look = ''});
@@ -78,17 +77,10 @@ class VideoQuote {
 
 /// Board state for the landscape client. Generation stays on the desktop API.
 class BoardController extends ChangeNotifier {
-  BoardController({SettingsStore? settings, OmniApi? api})
-      : _settings = settings ?? PrefsSettings(),
-        api = api ?? OmniApi('') {
-    baseUrl = this.api.baseUrl;
-    unawaited(_loadSettings());
-  }
+  BoardController({OmniApi? api}) : api = api ?? OmniApi(kOmniVideoBackend);
 
-  final SettingsStore _settings;
   OmniApi api;
 
-  String baseUrl = '';
   String status = '';
   String tab = 'transcribe';
   int epoch = 0;
@@ -166,24 +158,6 @@ class BoardController extends ChangeNotifier {
     );
   }
 
-  Future<void> _loadSettings() async {
-    final saved = normalizeBase(await _settings.loadBaseUrl());
-    if (_disposed || saved == null || saved == baseUrl) return;
-    _swapApi(saved);
-    _notify();
-  }
-
-  void _swapApi(String url) {
-    if (api.baseUrl == url) {
-      baseUrl = url;
-      return;
-    }
-    final next = OmniApi(url);
-    api.close();
-    api = next;
-    baseUrl = url;
-  }
-
   void _notify() {
     if (!_disposed) notifyListeners();
   }
@@ -201,27 +175,6 @@ class BoardController extends ChangeNotifier {
   void showTab(String name) {
     tab = name;
     _notify();
-  }
-
-  Future<void> setBaseUrl(String raw) async {
-    final next = normalizeBase(raw);
-    if (next == null) {
-      setStatus('Enter a backend address such as http://<tower>:8080');
-      return;
-    }
-    _swapApi(next);
-    await _settings.saveBaseUrl(next);
-    _notify();
-  }
-
-  Future<void> connect() async {
-    try {
-      final data = await api.get('/api/settings', timeout: OmniApi.settingsTimeout);
-      final hasKey = data['has_key'] == true;
-      setStatus(hasKey ? 'Backend connected.' : 'Backend connected. No API key on that machine.');
-    } on OmniException catch (err) {
-      setStatus(err.message);
-    }
   }
 
   Future<void> refreshProjects() async {
