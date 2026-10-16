@@ -42,6 +42,7 @@ VIDEO_MODEL = "grok-imagine-video-1.5-lite"
 VIDEO_RATE = 0.02
 VIDEO_RESOLUTION = "720p"
 VIDEO_MAX = 15
+VIDEO_FPS = 24
 MAX_CLIPS = 80
 
 # ACE-Step 1.5 runs on TEC's GPU (RTX 5050), in its own process. This laptop
@@ -1142,10 +1143,19 @@ async def media_duration(path: Path) -> float:
     return duration
 
 
+def video_frames(seconds: float) -> int:
+    return max(0, int(round(float(seconds) * VIDEO_FPS)))
+
+
 def video_graph(shots: list, song_index: int, song_seconds: float) -> str:
+    # A duration on tpad adds no frames when the clip has no frame duration,
+    # and cloned frames reuse one timestamp, so the muxer drops every hold.
+    # Count 24 fps frames, then renumber them. The lyric window is the only
+    # part that plays the clip. The gaps hold that shot's picture.
     parts = []
     labels = []
     cursor = 0
+    total_frames = 0
     for shot_index, shot in enumerate(shots):
         inputs = []
         for _piece in shot["pieces"]:
@@ -1155,35 +1165,41 @@ def video_graph(shots: list, song_index: int, song_seconds: float) -> str:
             chain = inputs[0]
         else:
             chain = "".join(inputs) + f"concat=n={len(inputs)}:v=1:a=0,"
+        span = max(1, video_frames(shot["span"]))
+        lead = video_frames(shot["lead"])
+        tail = video_frames(shot["tail"])
         chain += (
-            "setpts=PTS-STARTPTS,"
-            "fps=24,"
+            f"fps={VIDEO_FPS},"
             "scale=1280:720:force_original_aspect_ratio=decrease,"
             "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,"
             "setsar=1,"
-            f"tpad=stop_mode=clone:stop_duration={shot['span']:.3f},"
-            f"trim=duration={shot['span']:.3f},"
-            "setpts=PTS-STARTPTS"
+            f"settb=1/{VIDEO_FPS},"
+            "tpad=stop=-1:stop_mode=clone,"
+            f"trim=end_frame={span},"
+            "setpts=N"
         )
-        pads = []
-        if shot["lead"] >= 0.05:
-            pads.append(f"start_mode=clone:start_duration={shot['lead']:.3f}")
-        if shot["tail"] >= 0.05:
-            pads.append(f"stop_mode=clone:stop_duration={shot['tail']:.3f}")
-        if pads:
-            chain += ",tpad=" + ":".join(pads)
+        if lead or tail:
+            chain += (
+                f",tpad=start={lead}:start_mode=clone:stop={tail}:stop_mode=clone,"
+                "setpts=N"
+            )
         label = f"[s{shot_index}]"
         chain += label
         parts.append(chain)
         labels.append(label)
-    if cursor != song_index:
+        total_frames += lead + span + tail
+    if cursor != song_index or total_frames < 1:
+        raise HTTPException(500, "Could not assemble the video.")
+    picture = total_frames / VIDEO_FPS
+    if song_seconds > 0 and abs(picture - song_seconds) > 0.5:
         raise HTTPException(500, "Could not assemble the video.")
     if len(labels) == 1:
         parts[-1] = parts[-1][: -len(labels[0])] + "[outv]"
     else:
         parts.append("".join(labels) + f"concat=n={len(labels)}:v=1:a=0[outv]")
     parts.append(
-        f"[{song_index}:a]atrim=duration={song_seconds:.3f},asetpts=PTS-STARTPTS,"
+        f"[{song_index}:a]atrim=duration={picture:.6f},"
+        f"apad=whole_dur={picture:.6f},asetpts=PTS-STARTPTS,"
         "aformat=sample_rates=48000:channel_layouts=stereo[outa]"
     )
     return ";".join(parts)
@@ -1472,7 +1488,12 @@ async def project_video(project_id: str):
     path = project_folder(project_id) / "video.mp4"
     if not path.is_file():
         raise HTTPException(404, "No video yet.")
-    return FileResponse(path, media_type="video/mp4", filename="omnivid.mp4")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename="omnivid.mp4",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 if __name__ == "__main__":

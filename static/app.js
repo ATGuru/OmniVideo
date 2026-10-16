@@ -1648,7 +1648,11 @@ function showVideo(url, fresh) {
     return;
   }
   const bare = String(url).split("?")[0];
-  player.src = bare + (fresh ? "?t=" + Date.now() : "");
+  if (!fresh && videoUrl === bare && player.getAttribute("src")) {
+    player.hidden = false;
+    return;
+  }
+  player.src = bare + "?t=" + Date.now();
   player.hidden = false;
   videoUrl = bare;
 }
