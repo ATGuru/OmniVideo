@@ -725,6 +725,29 @@ def audio_kind(raw: bytes) -> str:
     return ""
 
 
+# Turbo was trained on captions that name a singer. A short mood with real
+# lyrics and no vocal word often comes back as an instrumental bed.
+_VOCAL_HINT = re.compile(
+    r"\b(vocal|vocals|singer|singers|singing|sung|voice|voices|choir|rap|rapping|rapper)\b",
+    re.I,
+)
+_INSTRUMENTAL_HINT = re.compile(r"\b(no\s+vocals?|instrumentals?)\b", re.I)
+
+
+def ace_caption(style: str, lyrics: str) -> tuple[str, bool]:
+    """Blank lyrics stay instrumental. Any other lyrics are sung."""
+    caption = " ".join(style.split())
+    if not lyrics:
+        return caption[:1000], True
+    caption = " ".join(_INSTRUMENTAL_HINT.sub(" ", caption).split()).strip(" ,.;")
+    if not caption:
+        caption = "vocal"
+    elif not _VOCAL_HINT.search(caption):
+        suffix = ", vocal"
+        caption = caption[: 1000 - len(suffix)].rstrip(" ,.;") + suffix
+    return caption[:1000], False
+
+
 @app.post("/api/generate-audio")
 async def generate_audio(body: dict = Body(...)):
     # ACE-Step 1.5 HTTP API on TEC. Change AUDIO_GEN_URL to move the model.
@@ -743,13 +766,16 @@ async def generate_audio(body: dict = Body(...)):
     if duration not in GEN_LENGTHS:
         raise HTTPException(400, "Length must be 15 seconds to 5 minutes.")
     lyrics = str(body.get("lyrics") or "").strip()[:12000]
+    # The lyric box is what the singer uses. The mood field is left as typed.
+    caption, instrumental = ace_caption(style, lyrics)
     if _audio_job:
         raise HTTPException(409, "Audio is already generating.")
     _audio_job = True
     try:
         request = {
-            "prompt": style[:1000],
-            "lyrics": lyrics,
+            "prompt": caption,
+            "lyrics": "" if instrumental else lyrics,
+            "instrumental": instrumental,
             "audio_duration": duration,
             "audio_format": "mp3",
             "batch_size": 1,
