@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 projects/
+generated/
 *.mp3
 *.wav
 *.m4a

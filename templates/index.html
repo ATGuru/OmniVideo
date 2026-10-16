@@ -4,13 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OmniVideo</title>
-<link rel="stylesheet" href="/static/style.css?v=9">
+<link rel="stylesheet" href="/static/style.css?v=13">
 </head>
 <body>
 <header>
   <h1>OmniVideo</h1>
-  <p id="project-title">No song loaded</p>
+  <p id="project-title">No project</p>
   <div class="header-actions">
+    <button id="new-project-btn" type="button">New project</button>
     <button id="save-btn" type="button">Save</button>
     <button id="settings-btn" type="button">API key</button>
   </div>
@@ -19,22 +20,58 @@
 
 <div class="workspace">
   <aside class="col" id="col-source">
-    <div id="upload-box" class="upload-box">
-      <p class="upload-kicker">Song</p>
-      <p id="song-label">Drop a song here, or choose a file</p>
-      <input id="song-file" type="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac">
-      <button id="choose-btn" type="button">Choose file</button>
+    <div class="source-tabs" role="tablist">
+      <button id="tab-transcribe" type="button" class="source-tab on" role="tab" aria-selected="true" aria-controls="pane-transcribe">Transcribe</button>
+      <button id="tab-generate" type="button" class="source-tab" role="tab" aria-selected="false" aria-controls="pane-generate">Generate</button>
     </div>
 
-    <div class="col-head">
-      <h2>Lyrics</h2>
-      <button id="transcribe-btn" type="button">Transcribe</button>
+    <div id="pane-transcribe" class="source-pane" role="tabpanel">
+      <div id="upload-box" class="upload-box">
+        <p class="upload-kicker">Song</p>
+        <p id="song-label">Drop a song here, or choose a file</p>
+        <input id="song-file" type="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.aac">
+        <button id="choose-btn" type="button">Choose file</button>
+      </div>
+
+      <div class="col-head">
+        <h2>Lyrics</h2>
+        <button id="transcribe-btn" type="button">Transcribe</button>
+      </div>
+      <p id="lyrics-note" class="note">Load a song, then transcribe.</p>
+      <div id="lyrics" class="lyrics"></div>
+      <div id="selection-bar" class="selection-bar" hidden draggable="true">
+        <span id="selection-label"></span>
+        <span class="drag-hint">Drag to the timeline</span>
+      </div>
     </div>
-    <p id="lyrics-note" class="note">Load a song, then transcribe.</p>
-    <div id="lyrics" class="lyrics"></div>
-    <div id="selection-bar" class="selection-bar" hidden draggable="true">
-      <span id="selection-label"></span>
-      <span class="drag-hint">Drag to the timeline</span>
+
+    <div id="pane-generate" class="source-pane" role="tabpanel" hidden>
+      <div id="gen-form" class="gen-form">
+        <label for="gen-style">Style / mood</label>
+        <textarea id="gen-style" rows="3" placeholder="Mood, genre, instruments"></textarea>
+        <div class="col-head">
+          <label for="gen-lyrics">Lyrics</label>
+          <button id="suggest-lyrics-btn" type="button" class="text-btn">Suggest lyrics</button>
+        </div>
+        <textarea id="gen-lyrics" rows="16" placeholder="Optional. Leave blank for instrumental."></textarea>
+        <label for="gen-length">Length</label>
+        <select id="gen-length">
+          <option value="15">15s</option>
+          <option value="30" selected>30s</option>
+          <option value="45">45s</option>
+          <option value="60">60s</option>
+          <option value="120">2:00</option>
+          <option value="180">3:00</option>
+          <option value="300">5:00</option>
+        </select>
+        <button id="gen-audio-btn" type="button">Generate</button>
+      </div>
+      <div id="gen-player" class="gen-player" hidden>
+        <button id="gen-play" type="button">Play</button>
+        <span id="gen-time">0:00</span>
+        <button id="gen-use" type="button">Use this track</button>
+        <audio id="gen-audio" preload="metadata"></audio>
+      </div>
     </div>
   </aside>
 
@@ -80,7 +117,33 @@
 
     <label for="master-prompt">Master prompt</label>
     <textarea id="master-prompt" rows="5" placeholder="Locked into every shot, along with that shot's own prompt"></textarea>
+
+    <div id="video-box" class="video-box">
+      <button id="video-btn" type="button">Generate video</button>
+      <div id="video-confirm" class="video-confirm" hidden>
+        <p id="video-estimate"></p>
+        <div class="modal-actions">
+          <button id="video-go" type="button">Generate</button>
+          <button id="video-cancel" type="button">Cancel</button>
+        </div>
+      </div>
+      <p id="video-note" class="note"></p>
+      <video id="video-player" controls playsinline hidden></video>
+    </div>
   </aside>
+</div>
+
+<div id="project-modal" class="modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="project-modal-title">
+  <div class="modal-content">
+    <h3 id="project-modal-title">New project</h3>
+    <p class="note">This starts a blank board. Stills generated for it are saved in ~/OmniVideo/Projects.</p>
+    <label for="project-name">Project name</label>
+    <input id="project-name" type="text" maxlength="60" autocomplete="off" placeholder="Name the folder">
+    <div class="modal-actions">
+      <button id="create-project" type="button">Create</button>
+      <button id="close-project" type="button">Cancel</button>
+    </div>
+  </div>
 </div>
 
 <div id="settings-modal" class="modal" style="display:none;">
@@ -116,6 +179,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=12"></script>
+<script src="/static/app.js?v=18"></script>
 </body>
 </html>

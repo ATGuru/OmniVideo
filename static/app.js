@@ -5,6 +5,7 @@ let editingIndex = null;
 let busy = false;
 
 let currentProject = null;
+let projectName = "";
 let songName = "";
 let songPath = "";
 let anchor = null;
@@ -17,6 +18,11 @@ let cast = [{ name: "", look: "" }];
 let seq = 1;
 let openFrame = null;
 let lastFrameButton = null;
+let audioJob = false;
+let generatedTrack = null;
+let videoUrl = "";
+let videoQuote = null;
+let videoTimer = 0;
 
 const lyricsEl = document.getElementById("lyrics");
 const selectionBar = document.getElementById("selection-bar");
@@ -25,6 +31,14 @@ const masterEl = document.getElementById("master-prompt");
 const uploadBox = document.getElementById("upload-box");
 const songFile = document.getElementById("song-file");
 const workCol = document.getElementById("col-work");
+
+function projectApi(id, suffix) {
+  return "/api/project/" + encodeURIComponent(id) + (suffix || "");
+}
+
+function showTitle() {
+  document.getElementById("project-title").textContent = projectName || songName || "No project";
+}
 
 function formatTime(t) {
   const m = Math.floor(t / 60);
@@ -56,7 +70,7 @@ function applySelection(canDrag) {
   lyricsEl.querySelectorAll(".lyric-line").forEach((line) => {
     const on = chosen.has(Number(line.dataset.index));
     line.classList.toggle("selected", on);
-    line.draggable = Boolean(canDrag && on);
+    if (!line.querySelector(".lyric-edit")) line.draggable = true;
   });
   const payload = selectionPayload();
   if (!payload) {
@@ -83,8 +97,31 @@ function clearSelection() {
 }
 
 function lyricNote() {
-  if (!lines.length) return "Load a song, then transcribe.";
+  if (lyricsSource === "written" && lines.length) {
+    return "These are the lyrics used to generate the track. Times are spread across its length. Double-click a line, or use Edit, to correct the words.";
+  }
+  if (lyricsSource === "written") return "Instrumental track. No lyrics were written for it.";
+  if (!lines.length) return songName ? "Song loaded. Transcribe to fill the lyrics." : "Load a song, then transcribe.";
   return lines.length + " lines from the song. Double-click a line, or use Edit, to correct the words.";
+}
+
+function linesFromLyrics(text, duration) {
+  const rows = String(text || "").split(/\r?\n/).map((row) => row.trim()).filter(Boolean);
+  if (!rows.length) return [];
+  const total = Math.max(rows.length * 0.1, Number(duration) || 30);
+  const slice = total / rows.length;
+  return rows.map((line, index) => {
+    const start = Math.round(index * slice * 10) / 10;
+    const end = index === rows.length - 1
+      ? Math.round(total * 10) / 10
+      : Math.round((index + 1) * slice * 10) / 10;
+    return { start, end: Math.max(end, start + 0.1), text: line };
+  });
+}
+
+function syncLyricsChrome() {
+  document.getElementById("transcribe-btn").hidden = lyricsSource === "written";
+  document.getElementById("lyrics-note").textContent = lyricNote();
 }
 
 function lyricSpan(text) {
@@ -116,6 +153,7 @@ function renderLyrics() {
   lines.forEach((line, index) => {
     const row = document.createElement("div");
     row.className = "lyric-line";
+    row.draggable = true;
     row.dataset.index = String(index);
     row.title = formatTime(line.start) + " – " + formatTime(line.end);
     const ts = document.createElement("span");
@@ -131,6 +169,7 @@ function renderLyrics() {
       beginLyricEdit(index);
     });
     row.append(ts, lyricSpan(line.text), edit);
+    if (lineUsed(line)) row.classList.add("used");
     lyricsEl.appendChild(row);
   });
   applySelection(selected.length > 0);
@@ -239,10 +278,57 @@ function overlaps(section) {
   );
 }
 
+function lineUsed(line) {
+  const span = Math.max(0.1, line.end - line.start);
+  return sections.some((sec) => {
+    const overlap = Math.min(sec.end, line.end) - Math.max(sec.start, line.start);
+    return overlap > span * 0.5;
+  });
+}
+
+function markUsedLines() {
+  lyricsEl.querySelectorAll(".lyric-line").forEach((row) => {
+    const line = lines[Number(row.dataset.index)];
+    row.classList.toggle("used", Boolean(line && lineUsed(line)));
+  });
+}
+
+function alreadyPlaced(payload) {
+  const text = String(payload.lyrics || "").trim();
+  return sections.some((sec) => {
+    const sameWords = text && String(sec.lyrics || "").trim() === text;
+    const covers = sec.start <= Number(payload.start) + 0.05 && sec.end >= Number(payload.end) - 0.05;
+    return sameWords && covers;
+  });
+}
+
+function fittingSpan(start, end) {
+  const gaps = [];
+  let from = start;
+  const blocks = [...sections].sort((a, b) => a.start - b.start || a.end - b.end);
+  for (const block of blocks) {
+    if (block.end <= from + 0.001 || block.start >= end - 0.001) continue;
+    if (block.start > from + 0.001) gaps.push([from, Math.min(block.start, end)]);
+    from = Math.max(from, block.end);
+    if (from >= end - 0.001) break;
+  }
+  if (from < end - 0.001) gaps.push([from, end]);
+  let best = null;
+  for (const gap of gaps) {
+    if (gap[1] - gap[0] < 0.2) continue;
+    if (!best || gap[1] - gap[0] > best[1] - best[0]) best = gap;
+  }
+  return best;
+}
+
 function renderTimeline() {
   const root = document.getElementById("timeline");
   root.replaceChildren();
-  document.getElementById("drop-hint").hidden = sections.length > 0;
+  const hint = document.getElementById("drop-hint");
+  hint.hidden = false;
+  hint.textContent = sections.length
+    ? "Drop more lyrics here. Each scene lands at its own time."
+    : "Drop a lyric selection here";
   sections.forEach((sec, index) => {
     const card = document.createElement("article");
     card.className = "section-card";
@@ -340,6 +426,7 @@ function renderTimeline() {
     card.append(head, lyric, body, shotStatus);
     root.appendChild(card);
   });
+  markUsedLines();
   renderReel();
 }
 
@@ -439,7 +526,7 @@ async function uploadStills(fileList, targetSec) {
   button.disabled = true;
   setStatus("Uploading " + files.length + (files.length === 1 ? " still…" : " stills…"));
   try {
-    const res = await fetch("/api/project/" + currentProject + "/stills", { method: "POST", body });
+    const res = await fetch(projectApi(currentProject, "/stills"), { method: "POST", body });
     if (!res.ok) throw new Error(await readError(res));
     const data = await res.json();
     const saved = data.stills || [];
@@ -503,7 +590,7 @@ async function removeUpload(item) {
   persist();
   if (!currentProject) return;
   const filename = String(item.url).split("?")[0].split("/").pop();
-  await fetch("/api/project/" + currentProject + "/stills/" + encodeURIComponent(filename), { method: "DELETE" });
+  await fetch(projectApi(currentProject, "/stills/" + encodeURIComponent(filename)), { method: "DELETE" });
 }
 
 function renderReel() {
@@ -616,10 +703,20 @@ function renderCast() {
 }
 
 function addSection(payload) {
+  if (alreadyPlaced(payload)) {
+    setStatus("That scene is already on the timeline.");
+    return;
+  }
+  const fit = fittingSpan(Number(payload.start), Number(payload.end));
+  if (!fit) {
+    setStatus("That moment is already a shot.");
+    return;
+  }
+  const clipped = fit[0] > Number(payload.start) + 0.05 || fit[1] < Number(payload.end) - 0.05;
   const sec = {
     id: newId(),
-    start: Number(payload.start),
-    end: Number(payload.end),
+    start: fit[0],
+    end: fit[1],
     lyrics: String(payload.lyrics || ""),
     prompt: "",
     suggesting: true,
@@ -629,7 +726,15 @@ function addSection(payload) {
   sections.sort((a, b) => a.start - b.start || a.end - b.end);
   renderTimeline();
   persist();
-  setStatus("Added " + formatTime(sec.start) + " – " + formatTime(sec.end) + ". Suggesting a prompt.");
+  const card = document.querySelector('.section-card[data-id="' + CSS.escape(sec.id) + '"]');
+  if (card) {
+    card.classList.add("placed");
+    card.scrollIntoView({ block: "nearest" });
+  }
+  const when = formatTime(sec.start) + " – " + formatTime(sec.end);
+  setStatus(clipped
+    ? "Placed at " + when + ", where the timeline had room. Suggesting a prompt."
+    : "Placed at " + when + ". Suggesting a prompt.");
   suggestPrompt(sec);
 }
 
@@ -687,8 +792,21 @@ async function suggestPrompt(sec) {
   }
 }
 
+function linePayload(index) {
+  const line = lines[index];
+  if (!line) return null;
+  return { start: line.start, end: line.end, lyrics: line.text };
+}
+
 function writeDrag(event) {
-  const payload = selectionPayload();
+  const line = event.target.closest && event.target.closest(".lyric-line");
+  let payload = null;
+  if (line) {
+    const index = Number(line.dataset.index);
+    payload = selected.includes(index) ? selectionPayload() : linePayload(index);
+  } else {
+    payload = selectionPayload();
+  }
   if (!payload) {
     event.preventDefault();
     return;
@@ -714,40 +832,59 @@ function isAudio(file) {
   return file.type.startsWith("audio/") || /\.(mp3|wav|m4a|flac|ogg|aac)$/i.test(file.name);
 }
 
-async function loadSong(file) {
+async function loadSong(file, written) {
   if (!isAudio(file)) {
     setStatus("Choose an audio file.");
-    return;
+    return false;
   }
   songName = file.name;
   document.getElementById("song-label").textContent = file.name;
-  document.getElementById("project-title").textContent = file.name;
+  showTitle();
   setStatus("Loading song…");
   const body = new FormData();
   body.append("file", file);
-  const res = await fetch("/api/project", { method: "POST", body });
+  const named = Boolean(projectName && currentProject);
+  const res = await fetch(named ? projectApi(currentProject, "/song") : "/api/project", { method: "POST", body });
   if (!res.ok) {
-    setStatus("Could not load the song.");
-    return;
+    setStatus(await readError(res));
+    return false;
   }
   const data = await res.json();
-  currentProject = data.project_id;
-  const timeline = await (await fetch("/api/project/" + currentProject)).json();
+  if (!named) currentProject = data.project_id;
+  showVideo("");
+  videoQuote = null;
+  stopVideoPoll();
+  document.getElementById("video-confirm").hidden = true;
+  document.getElementById("video-note").textContent = "";
+  const timeline = await (await fetch(projectApi(currentProject))).json();
   songPath = timeline.song_path || "";
   songName = timeline.song || file.name;
-  lines = [];
-  lyricsSource = "";
+  document.getElementById("song-label").textContent = songName;
+  showTitle();
   lyricsEdited = false;
   clearSelection();
+  if (written) {
+    lines = linesFromLyrics(written.lyrics, written.duration);
+    lyricsSource = "written";
+  } else {
+    lines = [];
+    lyricsSource = "";
+  }
   renderLyrics();
-  document.getElementById("lyrics-note").textContent = "Song loaded. Transcribe to fill the lyrics.";
+  syncLyricsChrome();
   persist();
-  setStatus("Song loaded. Transcribe to fill the lyrics.");
+  setStatus(written
+    ? (lines.length
+      ? "Track loaded. The lyrics you wrote are on the left."
+      : "Track loaded. No lyrics were written for it.")
+    : "Song loaded. Transcribe to fill the lyrics.");
+  return true;
 }
 
 function boardState() {
   return {
     projectId: currentProject,
+    projectName,
     songName,
     songPath,
     feel: feelEl.value,
@@ -758,7 +895,13 @@ function boardState() {
     seq,
     lyricsSource,
     lyricsEdited,
-    lines: lyricsSource === "song" ? lines : [],
+    lines: lyricsSource === "song" || lyricsSource === "written" ? lines : [],
+    sourceTab: document.getElementById("pane-generate").hidden ? "transcribe" : "generate",
+    genStyle: document.getElementById("gen-style").value,
+    genLyrics: document.getElementById("gen-lyrics").value,
+    genLength: document.getElementById("gen-length").value,
+    generatedTrack,
+    videoUrl,
   };
 }
 
@@ -772,12 +915,11 @@ function restore() {
   try {
     const data = JSON.parse(raw);
     currentProject = data.projectId || null;
+    projectName = data.projectName || "";
     songName = data.songName || "";
     songPath = data.songPath || "";
-    if (songName) {
-      document.getElementById("song-label").textContent = songName;
-      document.getElementById("project-title").textContent = songName;
-    }
+    if (songName) document.getElementById("song-label").textContent = songName;
+    showTitle();
     feelEl.value = data.feel || "";
     masterEl.value = data.master || "";
     if (Array.isArray(data.cast)) cast = data.cast;
@@ -786,16 +928,75 @@ function restore() {
       uploads = data.uploads.filter((item) => item && item.id && item.url);
     }
     if (data.seq) seq = data.seq;
-    if (data.lyricsSource === "song" && Array.isArray(data.lines) && data.lines.length) {
-      lines = data.lines;
-      lyricsSource = "song";
+    if (data.lyricsSource === "written" || (data.lyricsSource === "song" && Array.isArray(data.lines) && data.lines.length)) {
+      if (Array.isArray(data.lines)) lines = data.lines;
+      lyricsSource = data.lyricsSource;
     }
-    document.getElementById("lyrics-note").textContent = lines.length
-      ? lyricNote()
-      : (songName ? "Song loaded. Transcribe to fill the lyrics." : lyricNote());
+    syncLyricsChrome();
+    if (typeof data.genStyle === "string") document.getElementById("gen-style").value = data.genStyle;
+    if (typeof data.genLyrics === "string") document.getElementById("gen-lyrics").value = data.genLyrics;
+    if (data.genLength) document.getElementById("gen-length").value = String(data.genLength);
+    if (data.generatedTrack && data.generatedTrack.url && data.generatedTrack.name) {
+      showGenerated(data.generatedTrack);
+    }
+    if (typeof data.videoUrl === "string") videoUrl = data.videoUrl;
+    if (data.sourceTab === "generate") showSourceTab("generate", true);
   } catch {
     sessionStorage.removeItem("omnivid-board");
   }
+}
+
+function showSourceTab(name, quiet) {
+  const generate = name === "generate";
+  document.getElementById("pane-transcribe").hidden = generate;
+  document.getElementById("pane-generate").hidden = !generate;
+  const transcribeTab = document.getElementById("tab-transcribe");
+  const generateTab = document.getElementById("tab-generate");
+  transcribeTab.classList.toggle("on", !generate);
+  generateTab.classList.toggle("on", generate);
+  transcribeTab.setAttribute("aria-selected", String(!generate));
+  generateTab.setAttribute("aria-selected", String(generate));
+  if (!quiet) persist();
+}
+
+function clock(seconds) {
+  const whole = Math.max(0, Math.floor(Number(seconds) || 0));
+  return Math.floor(whole / 60) + ":" + String(whole % 60).padStart(2, "0");
+}
+
+function showGenerated(track) {
+  generatedTrack = track && track.url && track.name
+    ? {
+      url: track.url,
+      name: track.name,
+      lyrics: track.lyrics || "",
+      duration: Number(track.duration) || 0,
+    }
+    : null;
+  const bar = document.getElementById("gen-player");
+  const audio = document.getElementById("gen-audio");
+  const play = document.getElementById("gen-play");
+  if (!generatedTrack) {
+    bar.hidden = true;
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+    play.textContent = "Play";
+    document.getElementById("gen-time").textContent = "0:00";
+    return;
+  }
+  if (audio.getAttribute("src") !== generatedTrack.url) {
+    audio.src = generatedTrack.url;
+  }
+  bar.hidden = false;
+  updateGenTime();
+}
+
+function updateGenTime() {
+  const audio = document.getElementById("gen-audio");
+  const total = Number.isFinite(audio.duration) ? " / " + clock(audio.duration) : "";
+  document.getElementById("gen-time").textContent = clock(audio.currentTime) + total;
+  document.getElementById("gen-play").textContent = audio.paused ? "Play" : "Pause";
 }
 
 lyricsEl.addEventListener("pointerdown", (event) => {
@@ -842,11 +1043,11 @@ lyricsEl.addEventListener("dblclick", (event) => {
 });
 
 lyricsEl.addEventListener("dragstart", (event) => {
-  if (event.target.closest(".lyric-edit")) {
+  if (event.target.closest(".lyric-edit, .lyric-edit-btn")) {
     event.preventDefault();
     return;
   }
-  if (!event.target.closest(".lyric-line.selected")) {
+  if (!event.target.closest(".lyric-line")) {
     event.preventDefault();
     return;
   }
@@ -854,11 +1055,14 @@ lyricsEl.addEventListener("dragstart", (event) => {
 });
 
 workCol.addEventListener("dragover", (event) => {
-  if (event.target.closest(".still, .frame")) return;
   const types = [...event.dataTransfer.types];
-  if (types.includes("application/x-omnivid-still") || types.includes("Files")) return;
+  const stillDrag = types.includes("application/x-omnivid-still") || types.includes("Files");
+  if (stillDrag) {
+    if (event.target.closest(".still, .frame")) return;
+    return;
+  }
   event.preventDefault();
-  workCol.classList.add("over");
+  if (!event.target.closest(".still, .frame")) workCol.classList.add("over");
 });
 
 workCol.addEventListener("dragleave", (event) => {
@@ -921,7 +1125,7 @@ async function readError(res) {
 
 async function generateOne(sec) {
   const res = await fetch(
-    "/api/project/" + currentProject + "/sections/" + encodeURIComponent(sec.id) + "/image",
+    projectApi(currentProject, "/sections/" + encodeURIComponent(sec.id) + "/image"),
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -958,6 +1162,7 @@ async function runGenerate(list, label) {
   busy = true;
   document.getElementById("generate-btn").disabled = true;
   document.getElementById("transcribe-btn").disabled = true;
+  document.getElementById("video-btn").disabled = true;
   const reopenId = openFrame && openFrame.section ? openFrame.id : null;
   let spent = 0;
   try {
@@ -981,6 +1186,7 @@ async function runGenerate(list, label) {
     busy = false;
     document.getElementById("generate-btn").disabled = false;
     document.getElementById("transcribe-btn").disabled = false;
+    document.getElementById("video-btn").disabled = false;
   }
 }
 
@@ -992,9 +1198,10 @@ document.getElementById("transcribe-btn").addEventListener("click", async () => 
   }
   busy = true;
   document.getElementById("transcribe-btn").disabled = true;
+  document.getElementById("video-btn").disabled = true;
   setStatus("Transcribing on this machine. A full song can take several minutes.");
   try {
-    const res = await fetch("/api/project/" + currentProject + "/transcribe", { method: "POST" });
+    const res = await fetch(projectApi(currentProject, "/transcribe"), { method: "POST" });
     if (!res.ok) throw new Error(await readError(res));
     const data = await res.json();
     const next = (data.lines || [])
@@ -1009,7 +1216,7 @@ document.getElementById("transcribe-btn").addEventListener("click", async () => 
     lyricsSource = "song";
     clearSelection();
     renderLyrics();
-    document.getElementById("lyrics-note").textContent = lyricNote();
+    syncLyricsChrome();
     persist();
     setStatus("Transcription ready. Highlight lines and drag them onto the timeline.");
   } catch (err) {
@@ -1017,6 +1224,7 @@ document.getElementById("transcribe-btn").addEventListener("click", async () => 
   } finally {
     busy = false;
     document.getElementById("transcribe-btn").disabled = false;
+    document.getElementById("video-btn").disabled = false;
   }
 });
 
@@ -1048,14 +1256,110 @@ document.getElementById("add-character").addEventListener("click", () => {
 feelEl.addEventListener("input", persist);
 masterEl.addEventListener("input", persist);
 
-document.getElementById("save-btn").addEventListener("click", async () => {
-  if (!currentProject) {
-    setStatus("Load a song before saving. The board stays in this tab.");
+function resetBoard(name, id) {
+  projectName = name;
+  currentProject = id;
+  songName = "";
+  songPath = "";
+  lines = [];
+  lyricsSource = "";
+  lyricsEdited = false;
+  editingIndex = null;
+  selected = [];
+  anchor = null;
+  sections = [];
+  uploads = [];
+  cast = [{ name: "", look: "" }];
+  seq = 1;
+  feelEl.value = "";
+  masterEl.value = "";
+  videoUrl = "";
+  videoQuote = null;
+  busy = false;
+  stopVideoPoll();
+  showVideo("");
+  document.getElementById("video-confirm").hidden = true;
+  document.getElementById("video-note").textContent = "";
+  document.getElementById("video-estimate").textContent = "";
+  document.getElementById("video-go").textContent = "Generate";
+  document.getElementById("video-btn").disabled = false;
+  document.getElementById("video-go").disabled = false;
+  document.getElementById("generate-btn").disabled = false;
+  document.getElementById("transcribe-btn").disabled = false;
+  document.getElementById("song-label").textContent = "Drop a song here, or choose a file";
+  closeFrame();
+  showTitle();
+  renderLyrics();
+  syncLyricsChrome();
+  renderTimeline();
+  renderCast();
+  renderStillBin();
+  showSourceTab("transcribe", true);
+  persist();
+}
+
+function openProjectModal() {
+  const field = document.getElementById("project-name");
+  document.getElementById("project-modal").style.display = "flex";
+  field.value = "";
+  field.focus();
+}
+
+function closeProjectModal() {
+  document.getElementById("project-modal").style.display = "none";
+}
+
+let creatingProject = false;
+
+async function createNamedProject() {
+  if (creatingProject) return;
+  const field = document.getElementById("project-name");
+  const name = field.value.replace(/\s+/g, " ").trim();
+  if (!name) {
+    setStatus("Type a project name.");
+    field.focus();
     return;
   }
-  const existing = await (await fetch("/api/project/" + currentProject)).json();
+  creatingProject = true;
+  const button = document.getElementById("create-project");
+  button.disabled = true;
+  try {
+    const res = await fetch("/api/project/new", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    resetBoard(data.name, data.project_id);
+    closeProjectModal();
+    setStatus(
+      "Project \"" + data.name + "\" is ready. Stills save in ~/OmniVideo/Projects/" + data.name + "."
+    );
+  } catch (err) {
+    setStatus(err.message || "Could not create the project.");
+  } finally {
+    creatingProject = false;
+    button.disabled = false;
+  }
+}
+
+document.getElementById("new-project-btn").addEventListener("click", openProjectModal);
+document.getElementById("close-project").addEventListener("click", closeProjectModal);
+document.getElementById("create-project").addEventListener("click", createNamedProject);
+document.getElementById("project-modal").addEventListener("click", (event) => {
+  if (event.target.id === "project-modal") closeProjectModal();
+});
+
+document.getElementById("save-btn").addEventListener("click", async () => {
+  if (!currentProject) {
+    setStatus("Create a project, or load a song, before saving.");
+    return;
+  }
+  const existing = await (await fetch(projectApi(currentProject))).json();
   const timeline = {
     id: currentProject,
+    name: projectName || existing.name || "",
     song: existing.song || songName,
     song_path: existing.song_path || songPath,
     global_style: feelEl.value,
@@ -1074,13 +1378,14 @@ document.getElementById("save-btn").addEventListener("click", async () => {
       sent: sec.sent || "",
       source: sec.source || "",
     })),
+    video: videoUrl,
     uploads: uploads.map((item) => ({
       id: item.id,
       url: String(item.url).split("?")[0],
       name: item.name || "",
     })),
   };
-  const res = await fetch("/api/project/" + currentProject + "/timeline", {
+  const res = await fetch(projectApi(currentProject, "/timeline"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(timeline),
@@ -1167,6 +1472,16 @@ document.getElementById("frame-modal").addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  const projectOpen = document.getElementById("project-modal").style.display === "flex";
+  if (projectOpen && event.key === "Escape") {
+    closeProjectModal();
+    return;
+  }
+  if (projectOpen && event.key === "Enter" && event.target.id === "project-name" && !event.repeat) {
+    event.preventDefault();
+    createNamedProject();
+    return;
+  }
   const modalOpen = document.getElementById("frame-modal").style.display === "flex";
   if (event.key === "Escape" && modalOpen && !event.target.closest(".lyric-edit")) {
     closeFrame();
@@ -1202,8 +1517,325 @@ document.getElementById("save-key").addEventListener("click", async () => {
   setStatus(res.ok ? "API key saved on this machine." : "Could not save the API key.");
 });
 
+document.getElementById("tab-transcribe").addEventListener("click", () => showSourceTab("transcribe"));
+document.getElementById("tab-generate").addEventListener("click", () => showSourceTab("generate"));
+
+["gen-style", "gen-lyrics", "gen-length"].forEach((id) => {
+  const field = document.getElementById(id);
+  field.addEventListener("input", persist);
+  field.addEventListener("change", persist);
+});
+
+document.getElementById("gen-audio-btn").addEventListener("click", async () => {
+  if (audioJob) return;
+  const style = document.getElementById("gen-style").value.trim();
+  if (style.length < 2) {
+    setStatus("Write a style or mood first.");
+    return;
+  }
+  const lyrics = document.getElementById("gen-lyrics").value.trim();
+  const duration = Number(document.getElementById("gen-length").value) || 30;
+  audioJob = true;
+  document.getElementById("gen-audio-btn").disabled = true;
+  document.getElementById("suggest-lyrics-btn").disabled = true;
+  setStatus("Generating audio on TEC. This can take a few minutes.");
+  try {
+    const res = await fetch("/api/generate-audio", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: style, lyrics, duration }),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    showGenerated({
+      url: data.url,
+      name: data.name,
+      lyrics: typeof data.lyrics === "string" ? data.lyrics : lyrics,
+      duration: Number(data.duration) || duration,
+    });
+    persist();
+    setStatus(data.status || "Track ready. Play it, or use it as the song.");
+  } catch (err) {
+    setStatus(err.message || "Audio generation failed.");
+  } finally {
+    audioJob = false;
+    document.getElementById("gen-audio-btn").disabled = false;
+    document.getElementById("suggest-lyrics-btn").disabled = false;
+  }
+});
+
+document.getElementById("suggest-lyrics-btn").addEventListener("click", async () => {
+  if (audioJob) return;
+  const style = document.getElementById("gen-style").value.trim();
+  if (style.length < 2) {
+    setStatus("Write a style or mood first.");
+    return;
+  }
+  const button = document.getElementById("suggest-lyrics-btn");
+  button.disabled = true;
+  setStatus("Suggesting lyrics…");
+  try {
+    const res = await fetch("/api/suggest-lyrics", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: style }),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    document.getElementById("gen-lyrics").value = data.lyrics || "";
+    persist();
+    setStatus("Lyrics suggested. Edit them, then generate.");
+  } catch (err) {
+    setStatus(err.message || "Could not suggest lyrics.");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+const genAudio = document.getElementById("gen-audio");
+document.getElementById("gen-play").addEventListener("click", () => {
+  if (!generatedTrack) return;
+  if (genAudio.paused) genAudio.play().catch(() => setStatus("Could not play that track."));
+  else genAudio.pause();
+});
+genAudio.addEventListener("timeupdate", updateGenTime);
+genAudio.addEventListener("loadedmetadata", updateGenTime);
+genAudio.addEventListener("play", updateGenTime);
+genAudio.addEventListener("pause", updateGenTime);
+genAudio.addEventListener("ended", updateGenTime);
+
+document.getElementById("gen-use").addEventListener("click", async () => {
+  if (audioJob) return;
+  if (!generatedTrack || !generatedTrack.url) {
+    setStatus("Generate a track first.");
+    return;
+  }
+  const button = document.getElementById("gen-use");
+  button.disabled = true;
+  setStatus("Loading the generated track…");
+  try {
+    const res = await fetch(generatedTrack.url);
+    if (!res.ok) throw new Error("The generated file is missing.");
+    const blob = await res.blob();
+    const name = generatedTrack.name || "generated.mp3";
+    const type = blob.type || (name.endsWith(".wav") ? "audio/wav" : "audio/mpeg");
+    const file = new File([blob], name, { type });
+    const loaded = await loadSong(file, {
+      lyrics: generatedTrack.lyrics || "",
+      duration: generatedTrack.duration || genAudio.duration || 0,
+    });
+    if (loaded) showSourceTab("transcribe");
+  } catch (err) {
+    setStatus(err.message || "Could not use this track.");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+function stopVideoPoll() {
+  if (videoTimer) clearTimeout(videoTimer);
+  videoTimer = 0;
+}
+
+function showVideo(url, fresh) {
+  const player = document.getElementById("video-player");
+  if (!url) {
+    player.pause();
+    player.hidden = true;
+    player.removeAttribute("src");
+    player.load();
+    videoUrl = "";
+    return;
+  }
+  const bare = String(url).split("?")[0];
+  player.src = bare + (fresh ? "?t=" + Date.now() : "");
+  player.hidden = false;
+  videoUrl = bare;
+}
+
+function videoBody() {
+  return {
+    feel: feelEl.value,
+    master_prompt: masterEl.value,
+    characters: cast.filter((person) => person.name || person.look),
+    sections: sections.map((sec) => ({
+      id: sec.id,
+      start: sec.start,
+      end: sec.end,
+      lyrics: sec.lyrics || "",
+      prompt: sec.prompt || "",
+      image: sec.image ? String(sec.image).split("?")[0] : "",
+    })),
+  };
+}
+
+function hideVideoQuote() {
+  videoQuote = null;
+  document.getElementById("video-confirm").hidden = true;
+}
+
+function setVideoBusy(locked) {
+  busy = locked;
+  document.getElementById("video-btn").disabled = locked;
+  document.getElementById("video-go").disabled = locked;
+  document.getElementById("generate-btn").disabled = locked;
+  document.getElementById("transcribe-btn").disabled = locked;
+}
+
+async function pollVideo() {
+  if (!currentProject) return;
+  const project = currentProject;
+  try {
+    const res = await fetch(projectApi(project, "/video/status"));
+    if (!res.ok) throw new Error(await readError(res));
+    if (currentProject !== project) return;
+    const data = await res.json();
+    if (data.status === "running") {
+      const note = data.step || "Generating the video.";
+      document.getElementById("video-note").textContent = note;
+      setStatus(note);
+      videoTimer = setTimeout(pollVideo, 2000);
+      return;
+    }
+    setVideoBusy(false);
+    if (data.status === "done" && data.url) {
+      showVideo(data.url, true);
+      document.getElementById("video-note").textContent = data.step || "Video ready.";
+      setStatus(data.step || "Video ready.");
+      persist();
+      return;
+    }
+    if (data.status === "error") {
+      document.getElementById("video-note").textContent = data.error || "Video failed.";
+      setStatus(data.error || "Video failed.");
+      return;
+    }
+    if (data.url) showVideo(data.url);
+    else if (videoUrl) showVideo(videoUrl);
+  } catch (err) {
+    setVideoBusy(false);
+    setStatus(err.message || "Could not check the video.");
+  }
+}
+
+function beginVideoWait(data) {
+  hideVideoQuote();
+  setVideoBusy(true);
+  document.getElementById("video-note").textContent = (data && data.step) || "Starting the video.";
+  setStatus(document.getElementById("video-note").textContent);
+  stopVideoPoll();
+  videoTimer = setTimeout(pollVideo, 1500);
+}
+
+async function resumeVideo() {
+  if (!currentProject) {
+    if (videoUrl) showVideo(videoUrl);
+    return;
+  }
+  try {
+    const res = await fetch(projectApi(currentProject, "/video/status"));
+    if (!res.ok) {
+      if (videoUrl) showVideo(videoUrl);
+      return;
+    }
+    const data = await res.json();
+    if (data.status === "running") {
+      beginVideoWait(data);
+      return;
+    }
+    if (data.status === "error" && data.error) {
+      document.getElementById("video-note").textContent = data.error;
+    }
+    if (data.url) showVideo(data.url);
+    else if (videoUrl) showVideo(videoUrl);
+  } catch {
+    if (videoUrl) showVideo(videoUrl);
+  }
+}
+
+document.getElementById("video-btn").addEventListener("click", async () => {
+  if (busy) return;
+  if (!currentProject) {
+    setStatus("Load a song first.");
+    return;
+  }
+  if (!sections.length) {
+    setStatus("Add shots and images first.");
+    return;
+  }
+  const missing = sections.filter((sec) => !sec.image).length;
+  if (missing) {
+    const noun = missing === 1 ? "is" : "are";
+    setStatus("Every shot needs an image first. " + missing + " " + noun + " still empty.");
+    return;
+  }
+  hideVideoQuote();
+  document.getElementById("video-btn").disabled = true;
+  document.getElementById("video-note").textContent = "Estimating the cost…";
+  setStatus("Estimating the cost…");
+  try {
+    const res = await fetch(projectApi(currentProject, "/video/estimate"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(videoBody()),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    videoQuote = data;
+    document.getElementById("video-estimate").textContent = data.note || "";
+    document.getElementById("video-go").textContent = data.cost > 0
+      ? "Generate for $" + Number(data.cost).toFixed(2)
+      : "Assemble video";
+    document.getElementById("video-confirm").hidden = false;
+    document.getElementById("video-note").textContent = "";
+    setStatus("Check the cost, then confirm.");
+  } catch (err) {
+    document.getElementById("video-note").textContent = err.message || "Could not estimate the video.";
+    setStatus(err.message || "Could not estimate the video.");
+  } finally {
+    document.getElementById("video-btn").disabled = false;
+  }
+});
+
+document.getElementById("video-cancel").addEventListener("click", () => {
+  hideVideoQuote();
+  document.getElementById("video-note").textContent = "";
+  setStatus("Cancelled. Nothing was generated.");
+});
+
+document.getElementById("video-go").addEventListener("click", async () => {
+  if (busy || !videoQuote || !currentProject) return;
+  const quote = videoQuote;
+  const project = currentProject;
+  setVideoBusy(true);
+  hideVideoQuote();
+  document.getElementById("video-note").textContent = "Starting the video.";
+  setStatus("Starting the video.");
+  try {
+    const res = await fetch(projectApi(project, "/video"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ confirm: true, cost: quote.cost }, videoBody())),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    beginVideoWait(data);
+  } catch (err) {
+    setVideoBusy(false);
+    document.getElementById("video-note").textContent = err.message || "Video failed.";
+    setStatus(err.message || "Video failed.");
+  }
+});
+
+document.getElementById("video-player").addEventListener("error", () => {
+  const player = document.getElementById("video-player");
+  if (!player.getAttribute("src")) return;
+  document.getElementById("video-note").textContent = "The video file is missing.";
+});
+
 restore();
 renderLyrics();
 renderTimeline();
 renderCast();
 renderStillBin();
+resumeVideo();

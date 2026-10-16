@@ -122,6 +122,79 @@ button.text-btn:hover {
 
 #col-source { overflow: hidden; }
 
+.source-tabs {
+  display: flex;
+  gap: 0.35rem;
+  flex: 0 0 auto;
+}
+
+.source-tab { flex: 1; }
+
+.source-tab.on { background: rgba(0, 255, 255, 0.14); }
+
+.source-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.source-pane[hidden],
+.gen-player[hidden] { display: none; }
+
+.gen-form {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.gen-form label { margin-top: 0; }
+
+.gen-form textarea { resize: none; }
+
+#gen-lyrics {
+  flex: 1 1 auto;
+  min-height: 18rem;
+  resize: vertical;
+}
+
+.gen-form select {
+  width: auto;
+  align-self: flex-start;
+}
+
+#gen-audio-btn { align-self: flex-start; }
+
+.gen-player {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--cyan);
+  border-radius: 4px;
+  background: rgba(0, 255, 255, 0.06);
+}
+
+.gen-player button {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.82rem;
+}
+
+#gen-time {
+  flex: 1;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.gen-player audio { display: none; }
+
 .col-head {
   display: flex;
   align-items: center;
@@ -373,6 +446,12 @@ button.frame.flash { animation: flash 0.7s ease; }
   padding-bottom: 0.4rem;
 }
 
+.lyric-line.used:not(.selected) {
+  box-shadow: inset 2px 0 0 rgba(0, 255, 255, 0.4);
+}
+
+.section-card.placed { animation: flash 0.7s ease; }
+
 .lyric-line {
   display: grid;
   grid-template-columns: 4.6rem minmax(0, 1fr) auto;
@@ -573,7 +652,7 @@ label {
   margin-top: 0.35rem;
 }
 
-textarea, input[type="text"], input[type="password"] {
+textarea, input[type="text"], input[type="password"], select {
   width: 100%;
   background: var(--panel);
   border: 1px solid #333;
@@ -584,7 +663,7 @@ textarea, input[type="text"], input[type="password"] {
   resize: vertical;
 }
 
-textarea:focus, input:focus {
+textarea:focus, input:focus, select:focus {
   outline: 1px solid var(--cyan);
   border-color: var(--cyan);
 }
@@ -631,3 +710,36 @@ textarea:focus, input:focus {
 .modal-content h3 { margin: 0 0 0.2rem; }
 
 .modal-actions { display: flex; gap: 0.4rem; }
+
+.video-box {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding-top: 0.35rem;
+}
+
+.video-confirm {
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  padding: 0.55rem 0.65rem;
+  background: rgba(224, 177, 90, 0.08);
+}
+
+.video-confirm p {
+  margin: 0 0 0.55rem;
+  line-height: 1.4;
+}
+
+.video-confirm[hidden],
+#video-player[hidden] { display: none; }
+
+#video-note:empty { display: none; }
+
+#video-player {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: 4px;
+  display: block;
+}
