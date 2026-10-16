@@ -19,3 +19,23 @@ The board listens on port 8080. A phone on another network can use an SSH local 
 Songs, stills, and the API key stay on that machine. They are not in this repository.
 
 Original audio is optional. The board still works if that model is down. ACE-Step 1.5 runs on a separate GPU machine, not on the laptop that serves this board. A CPU load of that model runs the laptop out of memory. Point `AUDIO_GEN_URL` at that API. Optional `ACESTEP_API_KEY` is that server's own key, not the xAI key. Only one model should use that GPU at a time. Output is MP3, kept under `generated/`, then copied into the project when the track is used. The song itself is not sent to a cloud service.
+
+## Android client
+
+This branch adds a landscape Flutter client in `flutter/`. The phone does not run models. The desktop still runs `python main.py` and does the generation.
+
+```bash
+cd flutter
+flutter pub get
+flutter run
+```
+
+In the app, set the backend base URL to the machine running OmniVideo, for example `http://<tower>:8080`. The address is saved on the device. Use a Tailscale name or a local network address, port 8080. The app allows cleartext HTTP so that address can be typed in. Leave the address out of this repository.
+
+Create or open a named project before generating. Those folders are the server's OmniVideo/Projects directory. The existing phone file app can browse them when this branch's server is started with:
+
+```bash
+OMNIVIDEO_PROJECTS=/mnt/OBC/OmniVideo/Projects python main.py
+```
+
+That variable is the OmniBrain cloud folder, WebDAV path `OmniVideo/Projects/<name>`. Without it, named projects stay in `~/OmniVideo/Projects` on the desktop, which that file app does not browse. The web board is unchanged when the variable is unset. The client lists projects with `GET /api/projects`. Opening a project by name also works with `GET /api/project/<name>`.

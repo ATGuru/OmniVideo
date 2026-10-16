@@ -22,8 +22,17 @@ app = FastAPI(title="OmniVideo")
 BASE_DIR = Path(__file__).parent
 PROJECTS_DIR = BASE_DIR / "projects"
 PROJECTS_DIR.mkdir(exist_ok=True)
+def projects_dir() -> Path:
+    # Flutter client: set OMNIVIDEO_PROJECTS to the OmniBrain cloud folder
+    # the phone already browses, usually /mnt/OBC/OmniVideo/Projects
+    # (WebDAV path OmniVideo/Projects). Unset, the web board keeps
+    # ~/OmniVideo/Projects.
+    raw = os.getenv("OMNIVIDEO_PROJECTS", "").strip()
+    return Path(raw).expanduser() if raw else Path.home() / "OmniVideo" / "Projects"
+
+
 # Named projects live here so stills stay in a folder the user can find again.
-HOME_PROJECTS = Path.home() / "OmniVideo" / "Projects"
+HOME_PROJECTS = projects_dir()
 HOME_PROJECTS.mkdir(parents=True, exist_ok=True)
 KEY_FILE = Path.home() / "Documents" / "API" / "grok-video-pipeline.txt"
 
@@ -318,6 +327,30 @@ async def save_settings(api_key: str = Form("")):
     os.chmod(env_path, 0o600)
     os.environ["XAI_API_KEY"] = key
     return {"ok": True}
+
+
+@app.get("/api/projects")
+async def list_projects():
+    # Flutter client only. The web board does not call this.
+    # Names and a cloud-relative folder, never secrets or file contents.
+    root = HOME_PROJECTS.resolve()
+    cloud_root = None
+    try:
+        cloud_root = root.relative_to(Path("/mnt/OBC").resolve()).as_posix()
+    except ValueError:
+        cloud_root = None
+    items = []
+    try:
+        children = sorted(root.iterdir(), key=lambda path: path.name.lower())
+    except OSError:
+        children = []
+    for folder in children:
+        if not folder.is_dir() or not (folder / "timeline.json").is_file():
+            continue
+        if not NAME_RE.fullmatch(folder.name) or PROJECT_RE.fullmatch(folder.name):
+            continue
+        items.append({"id": folder.name, "name": folder.name})
+    return {"projects": items, "cloud_root": cloud_root}
 
 
 @app.post("/api/project")
