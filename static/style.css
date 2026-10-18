@@ -162,9 +162,26 @@ button.text-btn:hover {
   resize: vertical;
 }
 
+.gen-form .fit-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.15rem;
+  font-size: 0.92rem;
+}
+
+.gen-form .fit-row input {
+  width: auto;
+  margin: 0;
+}
+
 .gen-form select {
   width: auto;
   align-self: flex-start;
+}
+
+.gen-form select:disabled {
+  opacity: 0.45;
 }
 
 #gen-audio-btn { align-self: flex-start; }

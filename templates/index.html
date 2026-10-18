@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OmniVideo</title>
-<link rel="stylesheet" href="/static/style.css?v=13">
+<link rel="stylesheet" href="/static/style.css?v=14">
 </head>
 <body>
 <header>
@@ -54,6 +54,10 @@
           <button id="suggest-lyrics-btn" type="button" class="text-btn">Suggest lyrics</button>
         </div>
         <textarea id="gen-lyrics" rows="16" placeholder="Optional. Leave blank for instrumental."></textarea>
+        <label class="fit-row" for="gen-fit">
+          <input id="gen-fit" type="checkbox">
+          <span>Full song / fit to lyrics</span>
+        </label>
         <label for="gen-length">Length</label>
         <select id="gen-length">
           <option value="15">15s</option>
@@ -179,6 +183,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=19"></script>
+<script src="/static/app.js?v=21"></script>
 </body>
 </html>

@@ -900,6 +900,7 @@ function boardState() {
     genStyle: document.getElementById("gen-style").value,
     genLyrics: document.getElementById("gen-lyrics").value,
     genLength: document.getElementById("gen-length").value,
+    genFit: fitLyrics,
     generatedTrack,
     videoUrl,
   };
@@ -936,6 +937,15 @@ function restore() {
     if (typeof data.genStyle === "string") document.getElementById("gen-style").value = data.genStyle;
     if (typeof data.genLyrics === "string") document.getElementById("gen-lyrics").value = data.genLyrics;
     if (data.genLength) document.getElementById("gen-length").value = String(data.genLength);
+    const restoredLyrics = document.getElementById("gen-lyrics").value.trim().length > 0;
+    if (typeof data.genFit === "boolean") {
+      fitLyrics = data.genFit && restoredLyrics;
+      fitPinnedOff = restoredLyrics && !data.genFit;
+    } else if (restoredLyrics) {
+      fitLyrics = true;
+      fitPinnedOff = false;
+    }
+    refreshFitControls();
     if (data.generatedTrack && data.generatedTrack.url && data.generatedTrack.name) {
       showGenerated(data.generatedTrack);
     }
@@ -1520,11 +1530,81 @@ document.getElementById("save-key").addEventListener("click", async () => {
 document.getElementById("tab-transcribe").addEventListener("click", () => showSourceTab("transcribe"));
 document.getElementById("tab-generate").addEventListener("click", () => showSourceTab("generate"));
 
-["gen-style", "gen-lyrics", "gen-length"].forEach((id) => {
-  const field = document.getElementById(id);
-  field.addEventListener("input", persist);
-  field.addEventListener("change", persist);
+let fitLyrics = false;
+let fitPinnedOff = false;
+
+function lyricsPresent() {
+  return document.getElementById("gen-lyrics").value.trim().length > 0;
+}
+
+function refreshFitControls() {
+  const has = lyricsPresent();
+  const box = document.getElementById("gen-fit");
+  const select = document.getElementById("gen-length");
+  box.checked = Boolean(fitLyrics && has);
+  box.disabled = !has;
+  select.disabled = box.checked;
+}
+
+function syncFitFromLyrics() {
+  const has = lyricsPresent();
+  if (!has) {
+    fitLyrics = false;
+    fitPinnedOff = false;
+  } else if (!fitPinnedOff) {
+    fitLyrics = true;
+  }
+  refreshFitControls();
+}
+
+document.getElementById("gen-style").addEventListener("input", persist);
+document.getElementById("gen-style").addEventListener("change", persist);
+document.getElementById("gen-lyrics").addEventListener("input", () => {
+  syncFitFromLyrics();
+  persist();
 });
+document.getElementById("gen-length").addEventListener("change", () => {
+  if (lyricsPresent()) {
+    fitLyrics = false;
+    fitPinnedOff = true;
+    refreshFitControls();
+  }
+  persist();
+});
+document.getElementById("gen-fit").addEventListener("change", () => {
+  const has = lyricsPresent();
+  fitLyrics = document.getElementById("gen-fit").checked && has;
+  fitPinnedOff = has && !fitLyrics;
+  refreshFitControls();
+  persist();
+});
+
+async function requestAudio(style, lyrics, duration) {
+  const res = await fetch("/api/generate-audio", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: style, lyrics, duration }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data.detail;
+    const needed = detail && typeof detail === "object" ? Number(detail.needed) : NaN;
+    if (res.status === 409 && needed === -1) {
+      const message = detail.message || "These lyrics won't fit in that length. Fit the song to the lyrics?";
+      if (!window.confirm(message)) throw new Error(message);
+      fitLyrics = true;
+      fitPinnedOff = false;
+      refreshFitControls();
+      persist();
+      return requestAudio(style, lyrics, -1);
+    }
+    const message = typeof detail === "string" && detail
+      ? detail
+      : (detail && typeof detail.message === "string" && detail.message) || "Request failed.";
+    throw new Error(message);
+  }
+  return data;
+}
 
 document.getElementById("gen-audio-btn").addEventListener("click", async () => {
   if (audioJob) return;
@@ -1534,24 +1614,22 @@ document.getElementById("gen-audio-btn").addEventListener("click", async () => {
     return;
   }
   const lyrics = document.getElementById("gen-lyrics").value.trim();
-  const duration = Number(document.getElementById("gen-length").value) || 30;
+  const fit = fitLyrics && lyrics.length > 0;
+  const duration = fit ? -1 : (Number(document.getElementById("gen-length").value) || 30);
   audioJob = true;
   document.getElementById("gen-audio-btn").disabled = true;
   document.getElementById("suggest-lyrics-btn").disabled = true;
+  document.getElementById("gen-fit").disabled = true;
+  document.getElementById("gen-length").disabled = true;
   setStatus("Generating audio on TEC. This can take a few minutes.");
   try {
-    const res = await fetch("/api/generate-audio", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: style, lyrics, duration }),
-    });
-    if (!res.ok) throw new Error(await readError(res));
-    const data = await res.json();
+    const data = await requestAudio(style, lyrics, duration);
+    const reported = Number(data.duration);
     showGenerated({
       url: data.url,
       name: data.name,
       lyrics: typeof data.lyrics === "string" ? data.lyrics : lyrics,
-      duration: Number(data.duration) || duration,
+      duration: reported > 0 ? reported : (fit ? 0 : duration),
     });
     persist();
     setStatus(data.status || "Track ready. Play it, or use it as the song.");
@@ -1561,6 +1639,7 @@ document.getElementById("gen-audio-btn").addEventListener("click", async () => {
     audioJob = false;
     document.getElementById("gen-audio-btn").disabled = false;
     document.getElementById("suggest-lyrics-btn").disabled = false;
+    refreshFitControls();
   }
 });
 
@@ -1583,6 +1662,7 @@ document.getElementById("suggest-lyrics-btn").addEventListener("click", async ()
     if (!res.ok) throw new Error(await readError(res));
     const data = await res.json();
     document.getElementById("gen-lyrics").value = data.lyrics || "";
+    syncFitFromLyrics();
     persist();
     setStatus("Lyrics suggested. Edit them, then generate.");
   } catch (err) {
@@ -1838,6 +1918,7 @@ document.getElementById("video-player").addEventListener("error", () => {
 });
 
 restore();
+refreshFitControls();
 renderLyrics();
 renderTimeline();
 renderCast();
