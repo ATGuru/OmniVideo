@@ -103,11 +103,13 @@ function clearSelection() {
 
 function lyricNote() {
   if (lyricsSource === "written" && lines.length) {
-    return "These are the lyrics used to generate the track. Times are spread across its length. Double-click a line, or use Edit, to correct the words.";
+    return "These are the lyrics used to generate the track. Times are only spread across its length so far. Sync to the song to time them to the singing.";
   }
   if (lyricsSource === "written") return "Instrumental track. No lyrics were written for it.";
-  if (!lines.length) return songName ? "Song loaded. Transcribe to fill the lyrics." : "Load a song, then transcribe.";
-  return lines.length + " lines from the song. Double-click a line, or use Edit, to correct the words.";
+  if (!lines.length) return songName ? "Song loaded. Paste or choose the lyrics and sync, or transcribe." : "Load a song, then transcribe.";
+  const unsure = lines.filter((line) => line.sure === false).length;
+  const check = unsure ? " Lines marked ? may be off; check those." : "";
+  return lines.length + " lines, timed to the song." + check + " Double-click a line, or use Edit, to correct the words. Fixes are saved with the song.";
 }
 
 function linesFromLyrics(text, duration) {
@@ -124,9 +126,55 @@ function linesFromLyrics(text, duration) {
   });
 }
 
+function pastedLyrics() {
+  return document.getElementById("lyrics-paste").value.trim();
+}
+
 function syncLyricsChrome() {
-  document.getElementById("transcribe-btn").hidden = lyricsSource === "written";
+  const button = document.getElementById("transcribe-btn");
+  button.hidden = lyricsSource === "written" && !lines.length;
+  button.textContent = pastedLyrics() || lyricsSource === "written" ? "Sync to the song" : "Transcribe";
   document.getElementById("lyrics-note").textContent = lyricNote();
+}
+
+let lyricSaveTimer = 0;
+
+function saveLyricsSoon() {
+  if (!currentProject || !lines.length) return;
+  if (lyricSaveTimer) clearTimeout(lyricSaveTimer);
+  lyricSaveTimer = setTimeout(async () => {
+    lyricSaveTimer = 0;
+    try {
+      await fetch(projectApi(currentProject, "/lyrics"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lines, source: "edited" }),
+      });
+    } catch {
+      // The board keeps them in this tab; the next edit tries again.
+    }
+  }, 600);
+}
+
+async function loadSavedLyrics() {
+  if (!currentProject) return false;
+  try {
+    const res = await fetch(projectApi(currentProject, "/lyrics"));
+    if (!res.ok) return false;
+    const data = await res.json();
+    const saved = (data.lines || []).filter((line) => line && line.text);
+    if (!saved.length) return false;
+    lines = saved.map((line) => ({
+      start: Number(line.start) || 0,
+      end: Number(line.end) || 0,
+      text: String(line.text),
+      sure: line.sure !== false,
+    }));
+    lyricsSource = "song";
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function lyricSpan(text) {
@@ -164,6 +212,20 @@ function renderLyrics() {
     const ts = document.createElement("span");
     ts.className = "ts";
     ts.textContent = formatTime(line.start);
+    ts.title = "Play from this line";
+    ts.addEventListener("click", (event) => {
+      event.stopPropagation();
+      playFrom(lines[index].start);
+    });
+    const setBtn = document.createElement("button");
+    setBtn.type = "button";
+    setBtn.className = "text-btn lyric-set";
+    setBtn.textContent = "Set";
+    setBtn.title = "Press while the song plays: this line starts now";
+    setBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setLineStart(index);
+    });
     const edit = document.createElement("button");
     edit.type = "button";
     edit.className = "text-btn lyric-edit-btn";
@@ -173,12 +235,152 @@ function renderLyrics() {
       event.stopPropagation();
       beginLyricEdit(index);
     });
-    row.append(ts, lyricSpan(line.text), edit);
+    row.append(ts, lyricSpan(line.text), setBtn, edit);
     if (lineUsed(line)) row.classList.add("used");
+    if (line.sure === false) {
+      row.classList.add("unsure");
+      row.title += " · timing may be off";
+    }
     lyricsEl.appendChild(row);
   });
   applySelection(selected.length > 0);
+  playingIndex = -1;
+  markPlaying(true);
 }
+
+// ---- Song player: hear the song and check each line lands on time ----
+
+const songAudio = document.getElementById("song-audio");
+const songSeek = document.getElementById("song-seek");
+let playingIndex = -1;
+let seeking = false;
+let songTick = 0;
+
+function songUrl() {
+  return currentProject ? projectApi(currentProject, "/song") + "?p=" + encodeURIComponent(songPath || songName) : "";
+}
+
+function syncSongPlayer() {
+  const bar = document.getElementById("song-player");
+  const url = songName && currentProject ? songUrl() : "";
+  bar.hidden = !url;
+  if (!url) {
+    songAudio.pause();
+    songAudio.removeAttribute("src");
+    songAudio.load();
+    return;
+  }
+  if (songAudio.dataset.url !== url) {
+    songAudio.dataset.url = url;
+    songAudio.src = url;
+  }
+  paintSongClock();
+}
+
+function paintSongClock() {
+  const now = songAudio.currentTime || 0;
+  const total = Number.isFinite(songAudio.duration) ? songAudio.duration : songSeconds;
+  document.getElementById("song-clock").textContent = formatTime(now) + " / " + formatTime(total || 0);
+  if (!seeking) {
+    songSeek.max = String(total || 0);
+    songSeek.value = String(now);
+  }
+  document.getElementById("song-play").textContent = songAudio.paused ? "Play" : "Pause";
+}
+
+function currentLineIndex(t) {
+  let found = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i].start <= t + 0.02) found = i;
+    else break;
+  }
+  if (found >= 0 && t > lines[found].end + 1.5) return -1;
+  return found;
+}
+
+function markPlaying(force) {
+  const t = songAudio.currentTime || 0;
+  const index = songAudio.dataset.url && (songAudio.currentTime > 0 || !songAudio.paused) ? currentLineIndex(t) : -1;
+  if (index === playingIndex && !force) return;
+  playingIndex = index;
+  lyricsEl.querySelectorAll(".lyric-line.playing").forEach((row) => row.classList.remove("playing"));
+  if (index < 0) return;
+  const row = lyricsEl.querySelector('.lyric-line[data-index="' + index + '"]');
+  if (!row) return;
+  row.classList.add("playing");
+  if (!songAudio.paused && editingIndex === null) row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+function tickSong() {
+  paintSongClock();
+  markPlaying(false);
+  songTick = songAudio.paused ? 0 : requestAnimationFrame(tickSong);
+}
+
+function playFrom(seconds) {
+  if (!songAudio.dataset.url) {
+    setStatus("Load a song first.");
+    return;
+  }
+  // A little lead-in so the line's first word isn't clipped.
+  songAudio.currentTime = Math.max(0, Number(seconds) - 0.5);
+  songAudio.play().catch(() => setStatus("Could not play the song."));
+}
+
+function setLineStart(index) {
+  const line = lines[index];
+  if (!line) return;
+  if (!songAudio.dataset.url || (songAudio.paused && !(songAudio.currentTime > 0))) {
+    setStatus("Play the song, then press Set right as this line starts.");
+    return;
+  }
+  const t = Math.round((songAudio.currentTime || 0) * 100) / 100;
+  const prev = lines[index - 1];
+  const next = lines[index + 1];
+  if (prev && t <= prev.start + 0.05) {
+    setStatus("That's before the line above starts. Set that line first, or let the song play further.");
+    return;
+  }
+  if (next && t >= next.end - 0.05) {
+    setStatus("That's after the next line ends. Set the next line first.");
+    return;
+  }
+  const length = Math.max(0.3, line.end - line.start);
+  line.start = t;
+  line.end = Math.round(Math.max(t + 0.3, next ? Math.min(t + length, next.start) : t + length) * 100) / 100;
+  if (prev && prev.end > t) prev.end = t;
+  line.sure = true;
+  lyricsEdited = true;
+  saveLyricsSoon();
+  persist();
+  renderLyrics();
+  syncLyricsChrome();
+  setStatus("Line " + (index + 1) + " now starts at " + formatTime(t) + ". Saved with the song.");
+}
+
+songAudio.addEventListener("play", () => {
+  if (!songTick) songTick = requestAnimationFrame(tickSong);
+});
+songAudio.addEventListener("pause", tickSong);
+songAudio.addEventListener("ended", tickSong);
+songAudio.addEventListener("loadedmetadata", paintSongClock);
+songAudio.addEventListener("seeked", () => {
+  paintSongClock();
+  markPlaying(true);
+});
+document.getElementById("song-play").addEventListener("click", () => {
+  if (songAudio.paused) songAudio.play().catch(() => setStatus("Could not play the song."));
+  else songAudio.pause();
+});
+songSeek.addEventListener("input", () => {
+  seeking = true;
+  document.getElementById("song-clock").textContent =
+    formatTime(Number(songSeek.value)) + " / " + formatTime(Number(songSeek.max) || 0);
+});
+songSeek.addEventListener("change", () => {
+  seeking = false;
+  songAudio.currentTime = Number(songSeek.value) || 0;
+});
 
 function beginLyricEdit(index) {
   if (editingIndex === index) return;
@@ -235,6 +437,7 @@ function commitLyricEdit() {
   if (!next || next === prev) return;
   lines[index].text = next;
   lyricsEdited = true;
+  saveLyricsSoon();
   let shots = 0;
   sections.forEach((sec) => {
     if (!sec.lyrics || !sec.lyrics.includes(prev)) return;
@@ -337,7 +540,7 @@ function cardLabel(sec) {
   if (!sec) return "";
   if (sec.role === "cover") return "Cover";
   if (sec.role === "credit") return "End credit";
-  if (sec.role === "fill") return "Card";
+  if (sec.role === "fill") return "B-roll";
   return "";
 }
 
@@ -466,8 +669,8 @@ function renderCoverage() {
     total.textContent = "Covered " + covered.toFixed(1) + "s of " + songSeconds.toFixed(1) + "s";
     const hold = holdAmount();
     holdEl.textContent = hold !== null && hold > 0.25
-      ? "About " + Math.round(hold).toFixed(0) + "s of the song holds the current picture and is not billed."
-      : (sections.length ? "The timeline covers the song. Nothing is left as a still hold." : "");
+      ? "About " + Math.round(hold).toFixed(0) + "s has no card. The render plays the shot before each gap longer (billed). Fill gaps turns them into B-roll."
+      : (sections.length ? "Every second of the song has a card." : "");
   } else {
     total.textContent = "Covered " + covered.toFixed(1) + "s. The song length isn't known yet.";
     holdEl.textContent = "";
@@ -699,6 +902,161 @@ function placeEdgeCard(role) {
   insertGapCard(tail.start, tail.end, "credit");
 }
 
+const SHORT_GAP = 2.5;
+const BROLL_TARGET = 6;
+const BROLL_MIN = 4;
+const BROLL_MAX = 8;
+let filling = false;
+let beatCache = { project: null, data: null };
+
+async function loadBeats() {
+  if (beatCache.project === currentProject && beatCache.data) return beatCache.data;
+  const empty = { available: false, beats: [], bars: [] };
+  try {
+    const res = await fetch(projectApi(currentProject, "/beats"));
+    if (!res.ok) return empty;
+    const data = await res.json();
+    beatCache = { project: currentProject, data };
+    return data;
+  } catch {
+    return empty;
+  }
+}
+
+function nearestTime(list, target, reach) {
+  let best = null;
+  for (const t of list || []) {
+    const off = Math.abs(t - target);
+    if (off <= reach && (best === null || off < Math.abs(best - target))) best = t;
+  }
+  return best;
+}
+
+// Split one gap into shots of about 4–8 seconds. Inner cuts move to the
+// nearest bar line, or failing that the nearest beat, when one is close.
+function planCuts(start, end, beats) {
+  const length = end - start;
+  let count = Math.max(1, Math.round(length / BROLL_TARGET));
+  count = Math.max(count, Math.ceil(length / BROLL_MAX));
+  while (count > 1 && length / count < BROLL_MIN) count -= 1;
+  const marks = [start];
+  for (let k = 1; k < count; k += 1) {
+    const ideal = start + (length * k) / count;
+    const snapped = nearestTime(beats.bars, ideal, 1.5) ?? nearestTime(beats.beats, ideal, 0.5);
+    const prev = marks[marks.length - 1];
+    const cut = snapped !== null && snapped - prev >= 2 && end - snapped >= 2 ? snapped : ideal;
+    marks.push(Math.round(cut * 100) / 100);
+  }
+  marks.push(end);
+  const cuts = [];
+  for (let k = 0; k + 1 < marks.length; k += 1) cuts.push([marks[k], marks[k + 1]]);
+  return cuts;
+}
+
+function lyricNeighbors(start, end) {
+  let before = "";
+  let after = "";
+  orderedSections().forEach((sec) => {
+    const words = String(sec.lyrics || "").trim();
+    if (!words) return;
+    if (sec.end <= start + 0.05) before = words;
+    else if (!after && sec.start >= end - 0.05) after = words;
+  });
+  return { before, after };
+}
+
+// A short gap belongs to the card before it. With no card before it (the
+// very start of the song), the card after it starts earlier instead.
+function absorbGap(gap) {
+  const ordered = orderedSections();
+  const prev = [...ordered].reverse().find((sec) => sec.end <= gap.start + 0.05);
+  if (prev) {
+    prev.end = Math.round(gap.end * 1000) / 1000;
+    return true;
+  }
+  const next = ordered.find((sec) => sec.start >= gap.end - 0.05);
+  if (next) {
+    next.start = Math.round(gap.start * 1000) / 1000;
+    return true;
+  }
+  return false;
+}
+
+async function fillGaps() {
+  if (filling || busy) return;
+  if (!currentProject) {
+    setStatus("Load a song first.");
+    return;
+  }
+  if (!(songSeconds > 0)) {
+    setStatus("The song length isn't known yet.");
+    return;
+  }
+  const gaps = listGaps();
+  if (!gaps.length) {
+    setStatus("Every second of the song already has a card.");
+    return;
+  }
+  filling = true;
+  const button = document.getElementById("fill-gaps");
+  button.disabled = true;
+  setStatus("Finding the beat…");
+  try {
+    const beats = await loadBeats();
+    let stretched = 0;
+    const groups = [];
+    gaps.forEach((gap) => {
+      if (gap.end - gap.start < SHORT_GAP && sections.length) {
+        if (absorbGap(gap)) stretched += 1;
+        return;
+      }
+      const group = planCuts(gap.start, gap.end, beats).map(([start, end]) => ({
+        id: newId(),
+        role: "fill",
+        start,
+        end,
+        lyrics: "",
+        prompt: "",
+        suggesting: true,
+        promptEdited: false,
+      }));
+      sections.push(...group);
+      groups.push(group);
+    });
+    sections.sort((a, b) => a.start - b.start || a.end - b.end);
+    renderTimeline();
+    persist();
+    scheduleEstimate();
+    const made = groups.reduce((sum, group) => sum + group.length, 0);
+    const parts = [];
+    if (made) parts.push(made + " B-roll " + (made === 1 ? "card" : "cards"));
+    if (stretched) parts.push(stretched + " short " + (stretched === 1 ? "gap" : "gaps") + " joined to the shot before");
+    const beatNote = beats.available ? " Cuts land on the beat." : (beats.note ? " " + beats.note : "");
+    setStatus("Filled: " + parts.join(", ") + "." + beatNote + (made ? " Suggesting prompts…" : ""));
+    for (const group of groups) {
+      const used = [];
+      const around = lyricNeighbors(group[0].start, group[group.length - 1].end);
+      for (let i = 0; i < group.length; i += 1) {
+        const sec = group[i];
+        if (!sections.includes(sec)) continue;
+        await suggestPrompt(sec, {
+          broll: true,
+          before: around.before,
+          after: around.after,
+          index: i + 1,
+          total: group.length,
+          avoid: used,
+        });
+        if (sec.prompt) used.push(sec.prompt);
+      }
+    }
+    if (made) setStatus("B-roll prompts ready. Edit any of them, then Generate images.");
+  } finally {
+    filling = false;
+    button.disabled = false;
+  }
+}
+
 function renderTimeline() {
   const root = document.getElementById("timeline");
   root.replaceChildren();
@@ -838,6 +1196,7 @@ function renderTimeline() {
   markUsedLines();
   renderReel();
   renderHold();
+  scheduleClipStatus();
 }
 
 function isStillFile(file) {
@@ -1007,7 +1366,7 @@ function renderReel() {
   const frames = reelFrames();
   const note = document.getElementById("reel-note");
   note.textContent = sections.length
-    ? "Drag one of your stills onto a frame. Generate fills frames that are still empty, at $0.02 each."
+    ? clipNote()
     : "Frames show up here after you drop lyrics on the timeline.";
   const scroller = document.getElementById("reel-scroller");
   scroller.replaceChildren();
@@ -1016,7 +1375,7 @@ function renderReel() {
     button.type = "button";
     button.className = "frame";
     button.dataset.id = frame.id;
-    button.addEventListener("click", () => openFrameModal(frame, button));
+    button.addEventListener("click", () => openClipModal(frame.section, button));
     bindStillTarget(button, frame.section || null);
     const poster = document.createElement("span");
     poster.className = "poster";
@@ -1027,18 +1386,705 @@ function renderReel() {
       poster.appendChild(img);
     }
     const badge = document.createElement("span");
-    badge.className = "kind-badge";
-    const yours = frame.section && frame.section.source === "upload";
-    badge.textContent = frame.kind === "clip" ? "Clip" : yours ? "Yours" : "Still";
+    const state = clipState(frame.id);
+    badge.className = "kind-badge state-" + state;
+    badge.textContent = CLIP_BADGE[state] || "No clip";
     poster.appendChild(badge);
     const time = document.createElement("span");
     time.className = "frame-time";
     const label = frame.section ? cardLabel(frame.section) : cardLabel(frame);
-    time.textContent = (label ? label + " · " : "") + formatTime(frame.start) + " – " + formatTime(frame.end);
+    const row = clipInfo[frame.id];
+    const from = row ? row.start : frame.start;
+    const to = row ? row.end : frame.end;
+    time.textContent = (label ? label + " · " : "") + formatTime(from) + " – " + formatTime(to);
     button.append(poster, time);
     scroller.appendChild(button);
   });
   if (openFrame && !frames.some((frame) => frame.id === openFrame.id)) closeFrame();
+  if (openClip && !sections.includes(openClip)) closeClip();
+}
+
+// ---- Reference images: stills are edits of these, so shots stay consistent ----
+
+let refs = [];
+let refDefault = "";
+let refBusy = false;
+
+function applyRefs(data) {
+  refs = Array.isArray(data && data.references) ? data.references : [];
+  refDefault = (data && data.default) || "";
+  renderRefs();
+  fillFrameRef();
+}
+
+async function loadRefs() {
+  if (!currentProject) {
+    applyRefs(null);
+    return;
+  }
+  try {
+    const res = await fetch(projectApi(currentProject, "/references"));
+    if (res.ok) applyRefs(await res.json());
+  } catch {
+    // Keep what is shown.
+  }
+}
+
+function refName(id) {
+  const item = refs.find((ref) => ref.id === id);
+  return item ? item.name : "";
+}
+
+function renderRefs() {
+  const root = document.getElementById("ref-list");
+  root.replaceChildren();
+  if (!refs.length) {
+    const empty = document.createElement("p");
+    empty.className = "note";
+    empty.textContent = currentProject
+      ? "No reference yet. Without one, every still is drawn from scratch, and places and people can change between shots."
+      : "Create a project or load a song first.";
+    root.appendChild(empty);
+    return;
+  }
+  refs.forEach((ref) => {
+    const item = document.createElement("div");
+    item.className = "ref-item" + (ref.id === refDefault ? " default" : "");
+    const img = document.createElement("img");
+    img.src = ref.image + "?t=" + ref.id;
+    img.alt = "";
+    img.title = "Click to view full size";
+    img.tabIndex = 0;
+    img.addEventListener("click", () => openRefView(ref.id));
+    img.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      openRefView(ref.id);
+    });
+    const side = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "ref-name";
+    name.textContent = ref.name;
+    const actions = document.createElement("div");
+    actions.className = "ref-actions";
+    if (ref.id === refDefault) {
+      const tag = document.createElement("span");
+      tag.className = "ref-tag";
+      tag.textContent = "Default";
+      actions.appendChild(tag);
+    } else {
+      const make = document.createElement("button");
+      make.type = "button";
+      make.className = "text-btn";
+      make.textContent = "Make default";
+      make.addEventListener("click", () => refRequest("/references/" + ref.id, { default: true }, ref.name + " is now the default reference."));
+      actions.appendChild(make);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "text-btn";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", async () => {
+      if (!window.confirm("Remove the reference \"" + ref.name + "\"? Stills already made stay as they are.")) return;
+      try {
+        const res = await fetch(projectApi(currentProject, "/references/" + ref.id), { method: "DELETE" });
+        if (!res.ok) throw new Error(await readError(res));
+        sections.forEach((sec) => { if (sec.reference === ref.id) sec.reference = ""; });
+        persist();
+        applyRefs(await res.json());
+        setStatus("Reference removed.");
+      } catch (err) {
+        setStatus(err.message || "Could not remove the reference.");
+      }
+    });
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.className = "text-btn";
+    rename.textContent = "Rename";
+    rename.addEventListener("click", () => renameRef(ref.id));
+    actions.appendChild(rename);
+    actions.appendChild(remove);
+    side.append(name, actions);
+    item.append(img, side);
+    root.appendChild(item);
+  });
+}
+
+let viewingRef = "";
+
+async function renameRef(id) {
+  const current = refName(id);
+  const next = window.prompt("Rename this reference", current);
+  if (next === null) return;
+  const name = next.replace(/\s+/g, " ").trim();
+  if (!name || name === current) return;
+  await refRequest("/references/" + id, { name }, "Renamed to " + name + ".");
+  if (viewingRef === id) openRefView(id);
+}
+
+function openRefView(id) {
+  const ref = refs.find((item) => item.id === id);
+  if (!ref) return;
+  viewingRef = id;
+  document.getElementById("ref-view-title").textContent = ref.name;
+  document.getElementById("ref-view-img").src = ref.image + "?t=" + ref.id;
+  const using = sections.filter((sec) => (sec.reference || "") === id || (!sec.reference && id === refDefault)).length;
+  document.getElementById("ref-view-meta").textContent = (id === refDefault ? "Default reference. " : "") +
+    using + (using === 1 ? " card follows" : " cards follow") + " this reference.";
+  const make = document.getElementById("ref-view-default");
+  make.hidden = id === refDefault;
+  document.getElementById("ref-view-status").textContent = "";
+  document.getElementById("ref-modal").style.display = "flex";
+}
+
+let refEditing = false;
+
+document.getElementById("ref-edit-btn").addEventListener("click", async () => {
+  if (refEditing || !viewingRef || !currentProject) return;
+  const field = document.getElementById("ref-edit-prompt");
+  const wanted = field.value.trim();
+  const note = document.getElementById("ref-view-status");
+  if (!wanted) {
+    note.textContent = "Say what to change first.";
+    return;
+  }
+  refEditing = true;
+  const button = document.getElementById("ref-edit-btn");
+  button.disabled = true;
+  note.textContent = "Editing… about $0.02";
+  try {
+    const res = await fetch(projectApi(currentProject, "/references/" + viewingRef + "/edit"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: wanted }),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    applyRefs(data);
+    field.value = "";
+    if (data.new_id) openRefView(data.new_id);
+    document.getElementById("ref-view-status").textContent =
+      "Here's the edited version, saved as a new reference. Make it the default if it's right, or edit it again.";
+  } catch (err) {
+    note.textContent = err.message || "Could not edit the reference.";
+  } finally {
+    refEditing = false;
+    button.disabled = false;
+  }
+});
+
+document.getElementById("ref-view-rename").addEventListener("click", () => {
+  if (viewingRef) renameRef(viewingRef);
+});
+
+document.getElementById("ref-view-remove").addEventListener("click", async () => {
+  if (!viewingRef || !currentProject) return;
+  const id = viewingRef;
+  if (!window.confirm("Remove the reference \"" + refName(id) + "\"? Stills already made stay as they are.")) return;
+  try {
+    const res = await fetch(projectApi(currentProject, "/references/" + id), { method: "DELETE" });
+    if (!res.ok) throw new Error(await readError(res));
+    sections.forEach((sec) => { if (sec.reference === id) sec.reference = ""; });
+    persist();
+    applyRefs(await res.json());
+    closeRefView();
+    setStatus("Reference removed.");
+  } catch (err) {
+    document.getElementById("ref-view-status").textContent = err.message || "Could not remove the reference.";
+  }
+});
+
+function closeRefView() {
+  document.getElementById("ref-modal").style.display = "none";
+  viewingRef = "";
+}
+
+document.getElementById("close-ref").addEventListener("click", closeRefView);
+document.getElementById("ref-modal").addEventListener("click", (event) => {
+  if (event.target.id === "ref-modal") closeRefView();
+});
+document.getElementById("ref-view-default").addEventListener("click", async () => {
+  if (!viewingRef) return;
+  const id = viewingRef;
+  await refRequest("/references/" + id, { default: true }, refName(id) + " is now the default reference.");
+  openRefView(id);
+  document.getElementById("ref-view-status").textContent = "This is now the default. New stills follow it.";
+});
+
+async function refRequest(path, body, done) {
+  if (!currentProject) {
+    setStatus("Create a project or load a song first.");
+    return;
+  }
+  try {
+    const res = await fetch(projectApi(currentProject, path), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    applyRefs(await res.json());
+    if (done) setStatus(done);
+  } catch (err) {
+    setStatus(err.message || "Could not update the reference.");
+  }
+}
+
+function fillFrameRef() {
+  const select = document.getElementById("frame-ref");
+  if (!select) return;
+  select.replaceChildren();
+  const add = (value, label) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  };
+  add("", refDefault ? "Default: " + refName(refDefault) : "Default (no reference yet)");
+  refs.forEach((ref) => add(ref.id, ref.name));
+  add("none", "None: draw from scratch");
+  const sec = openFrame && openFrame.section;
+  const pick = sec ? sec.reference || "" : "";
+  select.value = pick === "none" || refs.some((ref) => ref.id === pick) ? pick : "";
+  select.disabled = !sec;
+}
+
+document.getElementById("frame-ref").addEventListener("change", (event) => {
+  if (!openFrame || !openFrame.section) return;
+  openFrame.section.reference = event.target.value;
+  persist();
+  setStatus("This shot will follow " + (event.target.value === "none"
+    ? "no reference"
+    : (refName(event.target.value || refDefault) || "the default reference")) + " next time it's generated.");
+});
+
+document.getElementById("frame-make-ref").addEventListener("click", async () => {
+  if (!openFrame || !openFrame.section || !openFrame.section.image) {
+    document.getElementById("frame-status").textContent = "This shot has no still yet.";
+    return;
+  }
+  const sec = openFrame.section;
+  const name = window.prompt("Name this reference", cardLabel(sec) || "Shot " + formatTime(sec.start));
+  if (name === null) return;
+  await refRequest("/references/from-still", {
+    image: String(sec.image).split("?")[0],
+    name,
+  }, "Saved this still as a reference.");
+  document.getElementById("frame-status").textContent = "Saved as a reference.";
+});
+
+document.getElementById("ref-generate").addEventListener("click", async () => {
+  if (refBusy) return;
+  if (!currentProject) {
+    setStatus("Create a project or load a song first.");
+    return;
+  }
+  refBusy = true;
+  const button = document.getElementById("ref-generate");
+  button.disabled = true;
+  setStatus("Generating a reference image… $0.02");
+  try {
+    const res = await fetch(projectApi(currentProject, "/references/generate"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: document.getElementById("ref-name").value,
+        prompt: document.getElementById("ref-prompt").value,
+        feel: feelEl.value,
+        master_prompt: masterEl.value,
+      }),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    applyRefs(await res.json());
+    document.getElementById("ref-name").value = "";
+    setStatus("Reference ready. If it isn't right, remove it and generate again. Stills follow the default.");
+  } catch (err) {
+    setStatus(err.message || "Could not generate the reference.");
+  } finally {
+    refBusy = false;
+    button.disabled = false;
+  }
+});
+
+const refFile = document.getElementById("ref-file");
+document.getElementById("ref-upload").addEventListener("click", () => {
+  refFile.value = "";
+  refFile.click();
+});
+refFile.addEventListener("change", async () => {
+  const file = refFile.files && refFile.files[0];
+  if (!file || !currentProject) return;
+  const body = new FormData();
+  body.append("file", file);
+  body.append("name", document.getElementById("ref-name").value);
+  setStatus("Uploading the reference…");
+  try {
+    const res = await fetch(projectApi(currentProject, "/references/upload"), { method: "POST", body });
+    if (!res.ok) throw new Error(await readError(res));
+    applyRefs(await res.json());
+    document.getElementById("ref-name").value = "";
+    setStatus("Reference added.");
+  } catch (err) {
+    setStatus(err.message || "Could not upload the reference.");
+  }
+});
+
+// ---- Fix this shot: talk to Grok about one still, then apply its rewrite ----
+
+let fixBusy = false;
+
+function refLabel(pick) {
+  if (pick === "none") return "None: draw from scratch";
+  if (!pick) return refDefault ? "Default (" + refName(refDefault) + ")" : "Default";
+  return refName(pick) || "Default";
+}
+
+function fixText(label, text) {
+  const wrap = document.createDocumentFragment();
+  const head = document.createElement("span");
+  head.className = "fix-label";
+  head.textContent = label;
+  const body = document.createElement("span");
+  body.className = "fix-text";
+  body.textContent = text;
+  wrap.append(head, body);
+  return wrap;
+}
+
+function renderFixLog() {
+  const log = document.getElementById("fix-log");
+  log.replaceChildren();
+  const sec = openFrame && openFrame.section;
+  if (!sec) return;
+  (sec.fixChat || []).forEach((turn, index) => {
+    const msg = document.createElement("div");
+    if (turn.role === "user") {
+      msg.className = "fix-msg you";
+      msg.textContent = turn.content;
+      log.appendChild(msg);
+      return;
+    }
+    msg.className = "fix-msg grok";
+    const reply = document.createElement("span");
+    reply.className = "fix-text";
+    reply.textContent = turn.reply || "";
+    msg.appendChild(reply);
+    const plan = turn.proposal;
+    if (plan && plan.prompt) {
+      msg.appendChild(fixText("New prompt", plan.prompt));
+      msg.appendChild(fixText("Reference", refLabel(plan.reference || "")));
+      if (plan.motion) msg.appendChild(fixText("Motion", plan.motion));
+      const actions = document.createElement("div");
+      actions.className = "fix-actions";
+      const apply = document.createElement("button");
+      apply.type = "button";
+      apply.textContent = "Apply";
+      apply.addEventListener("click", () => applyFix(sec, plan, false));
+      const regen = document.createElement("button");
+      regen.type = "button";
+      regen.textContent = "Apply and regenerate";
+      regen.addEventListener("click", () => applyFix(sec, plan, true));
+      actions.append(apply, regen);
+      if (index !== sec.fixChat.length - 1) {
+        apply.textContent = "Use this one";
+        regen.remove();
+      }
+      msg.appendChild(actions);
+    }
+    log.appendChild(msg);
+  });
+  log.scrollTop = log.scrollHeight;
+}
+
+function applyFix(sec, plan, regenerate) {
+  sec.prompt = plan.prompt;
+  sec.promptEdited = true;
+  sec.suggesting = false;
+  sec.reference = plan.reference || "";
+  if (plan.motion) sec.motion = plan.motion;
+  const popup = document.getElementById("frame-prompt");
+  if (openFrame && openFrame.section === sec) popup.value = sec.prompt;
+  const field = document.querySelector('.section-card[data-id="' + CSS.escape(sec.id) + '"] textarea');
+  if (field) field.value = sec.prompt;
+  fillFrameRef();
+  persist();
+  scheduleClipStatus();
+  if (regenerate) {
+    document.getElementById("frame-status").textContent = "Generating… about $0.02";
+    runGenerate([sec], "Regenerating");
+  } else {
+    document.getElementById("frame-status").textContent = "Applied. Regenerate when you're ready.";
+  }
+}
+
+async function sendFix() {
+  if (fixBusy || !openFrame || !openFrame.section || !currentProject) return;
+  const sec = openFrame.section;
+  const input = document.getElementById("fix-input");
+  const message = input.value.trim();
+  if (!message) return;
+  const look = document.getElementById("fix-look").checked && Boolean(sec.image);
+  const history = (sec.fixChat || []).map((turn) => (turn.role === "user"
+    ? { role: "user", content: turn.content }
+    : { role: "assistant", content: JSON.stringify(Object.assign({ reply: turn.reply }, turn.proposal || {})) }));
+  sec.fixChat = (sec.fixChat || []).concat([{ role: "user", content: message }]);
+  input.value = "";
+  renderFixLog();
+  fixBusy = true;
+  const button = document.getElementById("fix-send");
+  button.disabled = true;
+  button.textContent = look ? "Looking…" : "Thinking…";
+  try {
+    const res = await fetch(projectApi(currentProject, "/sections/" + encodeURIComponent(sec.id) + "/fix"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message,
+        history,
+        prompt: sec.prompt || "",
+        motion: sec.motion || "",
+        reference: sec.reference || "",
+        lyrics: sec.lyrics || "",
+        image: sec.image ? String(sec.image).split("?")[0] : "",
+        look,
+        feel: feelEl.value,
+        master_prompt: masterEl.value,
+        characters: cast.filter((person) => person.name || person.look),
+      }),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    sec.fixChat.push({
+      role: "assistant",
+      reply: data.reply || "",
+      proposal: data.prompt ? { prompt: data.prompt, reference: data.reference || "", motion: data.motion || "" } : null,
+    });
+  } catch (err) {
+    sec.fixChat.push({ role: "assistant", reply: err.message || "Could not reach Grok.", proposal: null });
+  } finally {
+    fixBusy = false;
+    button.disabled = false;
+    button.textContent = "Ask";
+    persist();
+    if (openFrame && openFrame.section === sec) renderFixLog();
+  }
+}
+
+document.getElementById("fix-send").addEventListener("click", sendFix);
+document.getElementById("fix-input").addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") event.stopPropagation();
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    sendFix();
+  }
+});
+
+// ---- Clips: one per shot, watched and remade from the Frames reel ----
+
+const CLIP_BADGE = {
+  made: "Clip",
+  stale: "Old clip",
+  missing: "No clip",
+  "no-still": "No still",
+};
+let clipInfo = {};
+let clipSummary = null;
+let clipTimer = 0;
+let clipToken = 0;
+let openClip = null;
+let lastClipButton = null;
+let clipJobTimer = 0;
+
+function clipState(id) {
+  const row = clipInfo[id];
+  if (row) return row.state;
+  const sec = sections.find((item) => item.id === id);
+  return sec && sec.image ? "missing" : "no-still";
+}
+
+function clipNote() {
+  const base = "Click a frame to watch its clip, change how it moves, or make it again.";
+  if (!clipSummary) return base;
+  if (!clipSummary.missing) return base + " Every frame with a still has a clip.";
+  const noun = clipSummary.missing === 1 ? "frame needs" : "frames need";
+  return base + " " + clipSummary.missing + " " + noun + " a clip, about $" +
+    Number(clipSummary.missing_cost).toFixed(2) + " with Make clips.";
+}
+
+function scheduleClipStatus() {
+  if (clipTimer) clearTimeout(clipTimer);
+  clipTimer = setTimeout(() => {
+    clipTimer = 0;
+    refreshClipStatus();
+  }, 400);
+}
+
+async function refreshClipStatus() {
+  if (!currentProject || !sections.length) {
+    clipInfo = {};
+    clipSummary = null;
+    renderReel();
+    return;
+  }
+  const token = ++clipToken;
+  try {
+    const res = await fetch(projectApi(currentProject, "/clips/status"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(videoBody()),
+    });
+    if (token !== clipToken) return;
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    clipInfo = {};
+    (data.clips || []).forEach((row) => { clipInfo[row.id] = row; });
+    clipSummary = data;
+  } catch {
+    if (token !== clipToken) return;
+    clipInfo = {};
+    clipSummary = null;
+  }
+  renderReel();
+  if (openClip) paintClipModal(false);
+}
+
+function playPieces(urls) {
+  const player = document.getElementById("clip-player");
+  const still = document.getElementById("clip-still");
+  player.pause();
+  player.onended = null;
+  if (!urls.length) {
+    player.removeAttribute("src");
+    player.load();
+    player.hidden = true;
+    const image = openClip && openClip.image ? openClip.image : "";
+    still.hidden = !image;
+    if (image) still.src = image;
+    return;
+  }
+  still.hidden = true;
+  player.hidden = false;
+  let index = 0;
+  // A shot longer than 15 seconds is several pieces. Play them back to back.
+  player.onended = () => {
+    index += 1;
+    if (index >= urls.length) return;
+    player.src = urls[index];
+    player.play().catch(() => {});
+  };
+  player.src = urls[0];
+  player.play().catch(() => {});
+}
+
+function paintClipModal(reload) {
+  if (!openClip) return;
+  const sec = openClip;
+  const row = clipInfo[sec.id];
+  const state = clipState(sec.id);
+  const label = cardLabel(sec);
+  const from = row ? row.start : sec.start;
+  const to = row ? row.end : sec.end;
+  document.getElementById("clip-title").textContent =
+    (label ? label + " · " : "") + formatTime(from) + " – " + formatTime(to);
+  const seconds = row ? row.seconds : 0;
+  const meta = {
+    made: "Clip made. " + seconds + "s.",
+    stale: "This clip is from an older prompt or length. Generate video would make it again.",
+    missing: "No clip yet." + (seconds ? " It will run " + seconds + "s." : ""),
+    "no-still": "Give this shot a still first. The clip starts from it.",
+  };
+  document.getElementById("clip-meta").textContent = meta[state] || "";
+  document.getElementById("clip-lyrics").textContent = shotWords(sec);
+  const motion = document.getElementById("clip-motion");
+  if (document.activeElement !== motion) motion.value = sec.motion || "";
+  motion.placeholder = sec.prompt
+    ? "Following the still: " + sec.prompt
+    : "How this clip moves. Leave blank to follow the still's prompt.";
+  const make = document.getElementById("clip-make");
+  if (state === "no-still" || !row) {
+    make.textContent = "Make clip";
+    make.disabled = state === "no-still" || busy;
+  } else if (state === "made") {
+    make.textContent = "Regenerate for $" + Number(row.redo_cost).toFixed(2);
+    make.disabled = busy;
+  } else {
+    make.textContent = "Make clip for $" + Number(row.cost).toFixed(2);
+    make.disabled = busy;
+  }
+  if (reload) playPieces(row ? row.urls || [] : []);
+}
+
+function openClipModal(sec, button) {
+  if (!sec) return;
+  openClip = sec;
+  lastClipButton = button || null;
+  document.getElementById("clip-status").textContent = "";
+  document.getElementById("clip-modal").style.display = "flex";
+  paintClipModal(true);
+  refreshClipStatus();
+}
+
+function closeClip() {
+  const player = document.getElementById("clip-player");
+  player.pause();
+  player.onended = null;
+  document.getElementById("clip-modal").style.display = "none";
+  openClip = null;
+  if (lastClipButton && lastClipButton.isConnected) lastClipButton.focus();
+  lastClipButton = null;
+}
+
+async function startClips(ids, redo, cost) {
+  const res = await fetch(projectApi(currentProject, "/clips/make"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ confirm: true, cost, ids, redo }, videoBody())),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  const data = await res.json();
+  if (data.status === "running") {
+    beginClipWait(data.step);
+  } else {
+    setStatus(data.step || "Done.");
+    refreshClipStatus();
+  }
+}
+
+function beginClipWait(step) {
+  setVideoBusy(true);
+  setStatus(step || "Making clips.");
+  if (openClip) {
+    document.getElementById("clip-status").textContent = step || "Making the clip.";
+    paintClipModal(false);
+  }
+  if (clipJobTimer) clearTimeout(clipJobTimer);
+  clipJobTimer = setTimeout(pollClipJob, 1500);
+}
+
+async function pollClipJob() {
+  clipJobTimer = 0;
+  if (!currentProject) return;
+  try {
+    const res = await fetch(projectApi(currentProject, "/video/status"));
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    const note = document.getElementById("clip-status");
+    if (data.status === "running") {
+      setStatus(data.step || "Making clips.");
+      if (openClip) note.textContent = data.step || "";
+      clipJobTimer = setTimeout(pollClipJob, 2000);
+      return;
+    }
+    setVideoBusy(false);
+    const text = data.status === "error" ? (data.error || "Clip failed.") : (data.step || "Clip ready.");
+    setStatus(text);
+    if (openClip) note.textContent = text;
+    await refreshClipStatus();
+    if (openClip && data.status !== "error") paintClipModal(true);
+  } catch (err) {
+    setVideoBusy(false);
+    setStatus(err.message || "Could not check the clip.");
+  }
 }
 
 function openFrameModal(frame, button) {
@@ -1064,7 +2110,10 @@ function openFrameModal(frame, button) {
   }
   const prompt = document.getElementById("frame-prompt");
   prompt.value = (openFrame.section ? openFrame.section.prompt : openFrame.prompt) || "";
-  document.getElementById("frame-sent").textContent = openFrame.sent ? "Sent: " + openFrame.sent : "";
+  document.getElementById("frame-sent").textContent = openFrame.sent || "";
+  document.querySelector(".frame-sent-box").hidden = !openFrame.sent;
+  fillFrameRef();
+  renderFixLog();
   document.getElementById("frame-status").textContent = "";
   document.getElementById("frame-modal").style.display = "flex";
   prompt.focus();
@@ -1151,12 +2200,13 @@ function addSection(payload) {
   suggestPrompt(sec);
 }
 
-async function suggestPrompt(sec) {
+async function suggestPrompt(sec, extra) {
   try {
     const res = await fetch("/api/suggest-prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        ...(extra || {}),
         lyrics: sec.lyrics,
         start: sec.start,
         end: sec.end,
@@ -1277,7 +2327,10 @@ async function loadSong(file, written) {
   showTitle();
   lyricsEdited = false;
   clearSelection();
-  if (written) {
+  const saved = await loadSavedLyrics();
+  if (saved) {
+    // This song was timed before, in this project or another one.
+  } else if (written) {
     lines = linesFromLyrics(written.lyrics, written.duration);
     lyricsSource = "written";
   } else {
@@ -1286,13 +2339,19 @@ async function loadSong(file, written) {
   }
   renderLyrics();
   syncLyricsChrome();
+  syncSongPlayer();
+  loadRefs();
   renderTimeline();
   persist();
-  setStatus(written
-    ? (lines.length
-      ? "Track loaded. The lyrics you wrote are on the left."
-      : "Track loaded. No lyrics were written for it.")
-    : "Song loaded. Transcribe to fill the lyrics.");
+  if (saved) {
+    setStatus("Song loaded with the lyrics you saved for it. No transcribing needed.");
+  } else {
+    setStatus(written
+      ? (lines.length
+        ? "Track loaded. Sync to the song to time your lyrics to the singing."
+        : "Track loaded. No lyrics were written for it.")
+      : "Song loaded. Paste or choose the lyrics and sync, or transcribe.");
+  }
   return true;
 }
 
@@ -1458,7 +2517,7 @@ function updateGenTime() {
 lyricsEl.addEventListener("pointerdown", (event) => {
   if (event.target.closest(".lyric-edit")) return;
   if (editingIndex !== null) commitLyricEdit();
-  if (event.target.closest(".lyric-edit-btn")) return;
+  if (event.target.closest(".lyric-edit-btn, .lyric-set, .ts")) return;
   const line = event.target.closest(".lyric-line");
   if (!line) {
     clearSelection();
@@ -1591,6 +2650,7 @@ async function generateOne(sec) {
         start: sec.start,
         end: sec.end,
         role: plainRole(sec.role) ? sec.role : "",
+        reference: sec.reference || "",
         feel: feelEl.value,
         master_prompt: masterEl.value,
         characters: cast.filter((person) => person.name || person.look),
@@ -1656,9 +2716,26 @@ document.getElementById("transcribe-btn").addEventListener("click", async () => 
   busy = true;
   document.getElementById("transcribe-btn").disabled = true;
   document.getElementById("video-btn").disabled = true;
-  setStatus("Transcribing on this machine. A full song can take several minutes.");
+  // Pasted lyrics win. A generated track syncs the lyrics it was made from.
+  let sheet = pastedLyrics();
+  if (!sheet && lyricsSource === "written") sheet = lines.map((line) => line.text).join("\n");
+  if (!sheet && lyricsSource === "song" && lines.length &&
+      !window.confirm("Replace these lyrics, and any fixes you made, with a fresh transcription?")) {
+    busy = false;
+    document.getElementById("transcribe-btn").disabled = false;
+    document.getElementById("video-btn").disabled = false;
+    setStatus("Kept your lyrics.");
+    return;
+  }
+  setStatus(sheet
+    ? "Timing your lyrics to the song. The first time takes a few minutes; after that it's instant."
+    : "Transcribing on this machine. The first time takes a few minutes; after that it's instant.");
   try {
-    const res = await fetch(projectApi(currentProject, "/transcribe"), { method: "POST" });
+    const res = await fetch(projectApi(currentProject, "/transcribe"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lyrics: sheet }),
+    });
     if (!res.ok) throw new Error(await readError(res));
     const data = await res.json();
     const next = (data.lines || [])
@@ -1666,6 +2743,7 @@ document.getElementById("transcribe-btn").addEventListener("click", async () => 
         start: Number(line.start) || 0,
         end: Number(line.end) || 0,
         text: String(line.text || "").trim(),
+        sure: line.sure !== false,
       }))
       .filter((line) => line.text);
     if (!next.length) throw new Error("Whisper returned no lines.");
@@ -1675,7 +2753,11 @@ document.getElementById("transcribe-btn").addEventListener("click", async () => 
     renderLyrics();
     syncLyricsChrome();
     persist();
-    setStatus("Transcription ready. Highlight lines and drag them onto the timeline.");
+    const unsure = Number(data.unsure) || 0;
+    const check = unsure ? " " + unsure + (unsure === 1 ? " line is" : " lines are") + " marked ? and may be off." : "";
+    if (data.source === "lrc") setStatus("Lyrics loaded with the times from your .lrc file.");
+    else if (data.source === "aligned") setStatus("Your lyrics are timed to the song." + check + " Drag lines onto the timeline.");
+    else setStatus("Transcription ready. Fix any words once; they're saved with the song.");
   } catch (err) {
     setStatus(err.message || "Transcription failed.");
   } finally {
@@ -1753,6 +2835,8 @@ function resetBoard(name, id) {
   renderCast();
   renderStillBin();
   showSourceTab("transcribe", true);
+  syncSongPlayer();
+  loadRefs();
   persist();
 }
 
@@ -1837,6 +2921,8 @@ document.getElementById("save-btn").addEventListener("click", async () => {
         sent: sec.sent || "",
         source: sec.source || "",
       };
+      if (sec.reference) row.reference = sec.reference;
+      if (sec.motion) row.motion = sec.motion;
       if (plainRole(sec.role)) row.role = sec.role;
       return row;
     }),
@@ -1934,6 +3020,15 @@ document.getElementById("frame-modal").addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && document.getElementById("ref-modal").style.display === "flex") {
+    if (event.target.id === "ref-edit-prompt") event.target.blur();
+    closeRefView();
+    return;
+  }
+  if (event.key === "Escape" && document.getElementById("clip-modal").style.display === "flex") {
+    closeClip();
+    return;
+  }
   const projectOpen = document.getElementById("project-modal").style.display === "flex";
   if (projectOpen && event.key === "Escape") {
     closeProjectModal();
@@ -1980,6 +3075,30 @@ document.getElementById("save-key").addEventListener("click", async () => {
 });
 
 document.getElementById("tab-transcribe").addEventListener("click", () => showSourceTab("transcribe"));
+const lyricsFile = document.getElementById("lyrics-file");
+document.getElementById("lyrics-file-btn").addEventListener("click", () => {
+  lyricsFile.value = "";
+  lyricsFile.click();
+});
+lyricsFile.addEventListener("change", async () => {
+  const file = lyricsFile.files && lyricsFile.files[0];
+  if (!file) return;
+  if (file.size > 200000) {
+    setStatus("That file is too big for lyrics.");
+    return;
+  }
+  document.getElementById("lyrics-paste").value = await file.text();
+  document.getElementById("lyrics-input").open = true;
+  syncLyricsChrome();
+  setStatus(/\.lrc$/i.test(file.name)
+    ? "Lyrics file loaded. Its own times will be used. Press Sync to the song."
+    : "Lyrics file loaded. Press Sync to the song to time them.");
+});
+document.getElementById("lyrics-paste").addEventListener("input", syncLyricsChrome);
+document.getElementById("lyrics-clear").addEventListener("click", () => {
+  document.getElementById("lyrics-paste").value = "";
+  syncLyricsChrome();
+});
 document.getElementById("tab-generate").addEventListener("click", () => showSourceTab("generate"));
 
 let fitLyrics = false;
@@ -2203,6 +3322,7 @@ function videoBody() {
         prompt: sec.prompt || "",
         image: sec.image ? String(sec.image).split("?")[0] : "",
       };
+      if (sec.motion) row.motion = sec.motion;
       if (plainRole(sec.role)) row.role = sec.role;
       return row;
     }),
@@ -2253,6 +3373,8 @@ async function refreshEstimate() {
 
 function setVideoBusy(locked) {
   busy = locked;
+  document.getElementById("make-clips-btn").disabled = locked;
+  document.getElementById("clip-make").disabled = locked;
   document.getElementById("video-btn").disabled = locked;
   document.getElementById("video-go").disabled = locked;
   document.getElementById("generate-btn").disabled = locked;
@@ -2275,6 +3397,7 @@ async function pollVideo() {
       return;
     }
     setVideoBusy(false);
+    scheduleClipStatus();
     if (data.status === "done" && data.url) {
       showVideo(data.url, true);
       document.getElementById("video-note").textContent = data.step || "Video ready.";
@@ -2317,7 +3440,8 @@ async function resumeVideo() {
     }
     const data = await res.json();
     if (data.status === "running") {
-      beginVideoWait(data);
+      if (data.kind === "clips") beginClipWait(data.step);
+      else beginVideoWait(data);
       return;
     }
     if (data.status === "error" && data.error) {
@@ -2412,10 +3536,84 @@ document.getElementById("video-player").addEventListener("error", () => {
 
 document.getElementById("add-cover").addEventListener("click", () => placeEdgeCard("cover"));
 document.getElementById("add-credit").addEventListener("click", () => placeEdgeCard("credit"));
+document.getElementById("fill-gaps").addEventListener("click", fillGaps);
+
+document.getElementById("close-clip").addEventListener("click", closeClip);
+document.getElementById("clip-modal").addEventListener("click", (event) => {
+  if (event.target.id === "clip-modal") closeClip();
+});
+document.getElementById("clip-motion").addEventListener("input", (event) => {
+  if (!openClip) return;
+  openClip.motion = event.target.value;
+  persist();
+  scheduleClipStatus();
+});
+document.getElementById("clip-still-btn").addEventListener("click", () => {
+  if (!openClip) return;
+  const sec = openClip;
+  closeClip();
+  openFrameModal(frameFromSection(sec, sections.indexOf(sec)));
+});
+document.getElementById("clip-make").addEventListener("click", async () => {
+  if (busy || !openClip || !currentProject) return;
+  const sec = openClip;
+  document.getElementById("clip-status").textContent = "Checking the cost…";
+  if (clipTimer) {
+    clearTimeout(clipTimer);
+    clipTimer = 0;
+  }
+  await refreshClipStatus();
+  const row = clipInfo[sec.id];
+  if (!row || row.state === "no-still") {
+    document.getElementById("clip-status").textContent = "Give this shot a still first.";
+    return;
+  }
+  const redo = row.state === "made";
+  const cost = redo ? row.redo_cost : row.cost;
+  document.getElementById("clip-status").textContent = "Starting… $" + Number(cost).toFixed(2);
+  try {
+    await startClips([sec.id], redo, cost);
+  } catch (err) {
+    setVideoBusy(false);
+    document.getElementById("clip-status").textContent = err.message || "Clip failed.";
+    refreshClipStatus();
+  }
+});
+document.getElementById("make-clips-btn").addEventListener("click", async () => {
+  if (busy) return;
+  if (!currentProject || !sections.length) {
+    setStatus("Add shots to the timeline first.");
+    return;
+  }
+  setStatus("Checking the cost…");
+  await refreshClipStatus();
+  if (!clipSummary) {
+    setStatus("Could not check the clips. Load the song first.");
+    return;
+  }
+  if (!clipSummary.missing) {
+    setStatus("Every frame with a still already has a clip.");
+    return;
+  }
+  const cost = Number(clipSummary.missing_cost);
+  const noun = clipSummary.missing === 1 ? "clip" : "clips";
+  if (!window.confirm("Make " + clipSummary.missing + " " + noun + " for about $" + cost.toFixed(2) + "?")) {
+    setStatus("Cancelled. Nothing was generated.");
+    return;
+  }
+  try {
+    await startClips(null, false, cost);
+  } catch (err) {
+    setVideoBusy(false);
+    setStatus(err.message || "Could not make the clips.");
+  }
+});
 
 restore();
 refreshFitControls();
 renderLyrics();
+syncSongPlayer();
+loadRefs();
 renderTimeline();
 renderCast();
 renderStillBin();

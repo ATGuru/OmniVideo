@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OmniVideo</title>
-<link rel="stylesheet" href="/static/style.css?v=17">
+<link rel="stylesheet" href="/static/style.css?v=24">
 </head>
 <body>
 <header>
@@ -33,10 +33,26 @@
         <button id="choose-btn" type="button">Choose file</button>
       </div>
 
+      <div id="song-player" class="song-player" hidden>
+        <button id="song-play" type="button">Play</button>
+        <input id="song-seek" type="range" min="0" max="0" step="0.1" value="0" aria-label="Song position">
+        <span id="song-clock" class="song-clock">0:00.0 / 0:00.0</span>
+        <audio id="song-audio" preload="auto"></audio>
+      </div>
+
       <div class="col-head">
         <h2>Lyrics</h2>
         <button id="transcribe-btn" type="button">Transcribe</button>
       </div>
+      <details id="lyrics-input" class="lyrics-input">
+        <summary>Have the lyrics? Paste them or choose a file</summary>
+        <textarea id="lyrics-paste" rows="8" placeholder="Paste the lyrics, one sung line per row. [Verse] and [Chorus] tags are fine. An .lrc file keeps its own times."></textarea>
+        <div class="header-actions">
+          <button id="lyrics-file-btn" type="button">Choose lyrics file</button>
+          <button id="lyrics-clear" type="button" class="text-btn">Clear</button>
+        </div>
+        <input id="lyrics-file" type="file" accept=".txt,.lrc,text/plain" hidden>
+      </details>
       <p id="lyrics-note" class="note">Load a song, then transcribe.</p>
       <div id="lyrics" class="lyrics"></div>
       <div id="selection-bar" class="selection-bar" hidden draggable="true">
@@ -86,9 +102,10 @@
         <div class="header-actions">
           <button id="add-cover" type="button">Cover</button>
           <button id="add-credit" type="button">End credit</button>
+          <button id="fill-gaps" type="button">Fill gaps</button>
         </div>
       </div>
-      <p class="note">Highlight lyrics on the left and drop them here. Drag a card's edge to change how long it plays. Insert a card in any gap that still holds a still picture. Cover fills the opening. End credit fills the close.</p>
+      <p class="note">Highlight lyrics on the left and drop them here. Drag a card's edge to change how long it plays. Insert a card in any gap that still holds a still picture. Cover fills the opening. End credit fills the close. Fill gaps covers every open stretch: short ones join the shot before, long ones become B-roll cards cut on the beat.</p>
       <div id="coverage" class="coverage" hidden>
         <div class="coverage-head">
           <strong id="coverage-total"></strong>
@@ -107,6 +124,7 @@
         <div class="header-actions">
           <button id="upload-stills-btn" type="button">Upload stills</button>
           <button id="generate-btn" type="button">Generate images</button>
+          <button id="make-clips-btn" type="button">Make clips</button>
         </div>
       </div>
       <p id="reel-note" class="note"></p>
@@ -132,6 +150,21 @@
 
     <label for="master-prompt">Master prompt</label>
     <textarea id="master-prompt" rows="5" placeholder="Locked into every shot, along with that shot's own prompt"></textarea>
+
+    <div class="col-head">
+      <h3>Reference images</h3>
+    </div>
+    <p class="note">Stills are drawn as edits of a reference, so the place and the people stay the same from shot to shot. Add one per place or person. Cards use the default unless you pick another in the still's popup. A still drawn from a reference skips the master prompt, since the reference already shows the place.</p>
+    <div id="ref-list" class="ref-list"></div>
+    <label for="ref-name">Name</label>
+    <input id="ref-name" type="text" maxlength="60" autocomplete="off" placeholder="e.g. Bedroom">
+    <label for="ref-prompt">Describe it</label>
+    <textarea id="ref-prompt" rows="3" placeholder="Leave blank to draw the setting from the master prompt, with nobody in it."></textarea>
+    <div class="header-actions">
+      <button id="ref-generate" type="button">Generate reference</button>
+      <button id="ref-upload" type="button">Upload</button>
+    </div>
+    <input id="ref-file" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" hidden>
 
     <div id="video-box" class="video-box">
       <button id="video-btn" type="button">Generate video</button>
@@ -175,25 +208,92 @@
 </div>
 
 <div id="frame-modal" class="modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="frame-title">
-  <div class="modal-content frame-dialog">
+  <div class="modal-content frame-dialog frame-split-dialog">
     <div class="col-head">
       <h3 id="frame-title">Frame</h3>
       <button id="close-frame" type="button" class="text-btn">Close</button>
     </div>
-    <div id="frame-stage" class="frame-stage"></div>
-    <p id="frame-meta" class="note"></p>
-    <p id="frame-lyrics" class="shot-lyrics"></p>
-    <label for="frame-prompt">Prompt</label>
-    <textarea id="frame-prompt" rows="5" placeholder="Prompt for this image"></textarea>
-    <p id="frame-sent" class="note"></p>
-    <div class="modal-actions">
-      <button id="frame-upload" type="button">Use a still</button>
-      <button id="frame-regen" type="button">Regenerate</button>
+    <div class="frame-split">
+      <div class="frame-left">
+        <div id="frame-stage" class="frame-stage"></div>
+        <p id="frame-meta" class="note"></p>
+        <p id="frame-lyrics" class="shot-lyrics"></p>
+      </div>
+      <div class="frame-right">
+        <label for="frame-prompt">Prompt</label>
+        <textarea id="frame-prompt" rows="5" placeholder="Prompt for this image"></textarea>
+        <label for="frame-ref">Reference</label>
+        <select id="frame-ref"></select>
+        <div class="modal-actions">
+          <button id="frame-upload" type="button">Use a still</button>
+          <button id="frame-regen" type="button">Regenerate</button>
+          <button id="frame-make-ref" type="button">Use as reference</button>
+        </div>
+        <p id="frame-status" class="shot-status"></p>
+        <details class="frame-sent-box">
+          <summary>Sent prompt</summary>
+          <p id="frame-sent" class="note"></p>
+        </details>
+        <div class="fix-box">
+          <h4>Fix this shot</h4>
+          <div id="fix-log" class="fix-log"></div>
+          <textarea id="fix-input" rows="2" placeholder="Say what's wrong, the way you'd tell a person. Enter sends."></textarea>
+          <div class="fix-row">
+            <label class="fit-row" for="fix-look">
+              <input id="fix-look" type="checkbox">
+              <span>Let it see the still</span>
+            </label>
+            <button id="fix-send" type="button">Ask</button>
+          </div>
+        </div>
+      </div>
     </div>
-    <p id="frame-status" class="shot-status"></p>
   </div>
 </div>
 
-<script src="/static/app.js?v=23"></script>
+<div id="ref-modal" class="modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="ref-view-title">
+  <div class="modal-content frame-dialog ref-dialog">
+    <div class="col-head">
+      <h3 id="ref-view-title">Reference</h3>
+      <button id="close-ref" type="button" class="text-btn">Close</button>
+    </div>
+    <div class="frame-stage"><img id="ref-view-img" alt=""></div>
+    <p id="ref-view-meta" class="note"></p>
+    <label for="ref-edit-prompt">Change this reference</label>
+    <textarea id="ref-edit-prompt" rows="3" placeholder="Say what to change. Everything else stays the same. The result is saved as a new reference, so this one is kept."></textarea>
+    <div class="modal-actions">
+      <button id="ref-edit-btn" type="button">Edit, about $0.02</button>
+      <button id="ref-view-default" type="button">Make default</button>
+      <button id="ref-view-rename" type="button">Rename</button>
+      <button id="ref-view-remove" type="button">Remove</button>
+    </div>
+    <p id="ref-view-status" class="shot-status"></p>
+  </div>
+</div>
+
+<div id="clip-modal" class="modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="clip-title">
+  <div class="modal-content frame-dialog">
+    <div class="col-head">
+      <h3 id="clip-title">Clip</h3>
+      <button id="close-clip" type="button" class="text-btn">Close</button>
+    </div>
+    <div id="clip-stage" class="frame-stage">
+      <video id="clip-player" controls playsinline muted></video>
+      <img id="clip-still" alt="" hidden>
+    </div>
+    <p id="clip-meta" class="note"></p>
+    <p id="clip-lyrics" class="shot-lyrics"></p>
+    <label for="clip-motion">Motion prompt</label>
+    <textarea id="clip-motion" rows="4" placeholder="How this clip moves. Leave blank to follow the still's prompt."></textarea>
+    <p class="note">Blank follows the still's prompt. A change here makes this clip again; the still stays as it is.</p>
+    <div class="modal-actions">
+      <button id="clip-make" type="button">Make clip</button>
+      <button id="clip-still-btn" type="button">Edit still</button>
+    </div>
+    <p id="clip-status" class="shot-status"></p>
+  </div>
+</div>
+
+<script src="/static/app.js?v=33"></script>
 </body>
 </html>

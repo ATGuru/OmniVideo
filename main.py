@@ -47,10 +47,16 @@ MAX_STILL = 20 * 1024 * 1024
 IMAGE_MODEL = "grok-imagine-image"
 TEXT_MODEL = "grok-4.20-0309-non-reasoning"
 IMAGE_COST = 0.02
-# grok-imagine-video-1.5-lite is $0.02 per generated second (docs, model page).
+# Editing from a reference image adds an input charge per source image.
+IMAGE_INPUT_COST = 0.002
+IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", "").strip() or IMAGE_MODEL
+# grok-imagine-video-1.5-lite at 720p is $0.03 per generated second, plus
+# $0.01 for the starting image of each request (docs.x.ai pricing page).
 # One request is 1–15 seconds. 720p. The song is muxed locally afterwards.
 VIDEO_MODEL = "grok-imagine-video-1.5-lite"
-VIDEO_RATE = 0.02
+VIDEO_RATE = 0.03
+# Each clip request also pays for its starting image.
+VIDEO_IMAGE_COST = 0.01
 VIDEO_RESOLUTION = "720p"
 VIDEO_MAX = 15
 VIDEO_FPS = 24
@@ -144,10 +150,13 @@ def safe_song_name(filename: str) -> str:
     return name[:120]
 
 
-def compose_prompt(timeline: dict, section: dict) -> str:
+def compose_prompt(timeline: dict, section: dict, with_master: bool = True) -> str:
+    # with_master=False when the still is an edit of a reference image: the
+    # reference already shows the place, and repeating it in words competes
+    # with the picture and buries the shot's own instructions.
     parts = []
     feel = str(timeline.get("feel") or timeline.get("global_style") or "").strip()
-    master = str(timeline.get("master_prompt") or "").strip()
+    master = str(timeline.get("master_prompt") or "").strip() if with_master else ""
     if feel:
         parts.append(feel)
     if master:
@@ -170,7 +179,7 @@ def compose_prompt(timeline: dict, section: dict) -> str:
     elif lyrics:
         parts.append(lyrics)
     parts.append("Cinematic 16:9 still, no readable text, no logos")
-    return ". ".join(parts)[:2000]
+    return ". ".join(part.rstrip(" .") for part in parts)[:2000]
 
 
 def motion_prompt(timeline: dict, section: dict) -> str:
@@ -192,9 +201,14 @@ def motion_prompt(timeline: dict, section: dict) -> str:
             characters.append(bit[:240])
     if characters:
         parts.append("Characters: " + "; ".join(characters))
+    # A shot's own motion prompt (set in the clip popup) wins over the still's
+    # prompt. Left blank, the clip follows the still, as before.
+    motion = str(section.get("motion") or "").strip()
     shot = str(section.get("prompt") or "").strip()
     lyrics = str(section.get("lyrics") or "").strip()
-    if shot:
+    if motion:
+        parts.append(motion)
+    elif shot:
         parts.append(shot)
     elif lyrics:
         parts.append(lyrics)
@@ -250,23 +264,35 @@ def response_text(payload: dict) -> str:
     return "\n".join(chunks).strip()
 
 
-async def imagine(prompt: str) -> bytes:
+async def imagine(prompt: str, reference: Path | None = None) -> bytes:
+    """One still. With a reference, the still is drawn as an edit of that
+    image, so the place and people in it stay the same from shot to shot."""
     key = api_key()
     if not key:
         raise HTTPException(400, "No API key is available on this machine.")
     headers = {"Authorization": f"Bearer {key}"}
-    async with httpx.AsyncClient(timeout=180) as client:
-        response = await client.post(
-            "https://api.x.ai/v1/images/generations",
-            headers=headers,
-            json={
-                "model": IMAGE_MODEL,
-                "prompt": prompt,
-                "aspect_ratio": "16:9",
-                "resolution": "1k",
-                "n": 1,
+    if reference is not None:
+        endpoint = "https://api.x.ai/v1/images/edits"
+        body = {
+            "model": IMAGE_EDIT_MODEL,
+            "prompt": prompt,
+            "image": {
+                "type": "image_url",
+                "url": "data:" + image_mime(reference) + ";base64,"
+                + base64.b64encode(reference.read_bytes()).decode("ascii"),
             },
-        )
+        }
+    else:
+        endpoint = "https://api.x.ai/v1/images/generations"
+        body = {
+            "model": IMAGE_MODEL,
+            "prompt": prompt,
+            "aspect_ratio": "16:9",
+            "resolution": "1k",
+            "n": 1,
+        }
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(endpoint, headers=headers, json=body)
         if response.status_code >= 400:
             raise HTTPException(response.status_code, error_text(response))
         try:
@@ -294,8 +320,57 @@ def image_ext(raw: bytes) -> str:
     return ""
 
 
+REF_RE = re.compile(r"^r[a-f0-9]{6}$")
+REF_LEAD = (
+    "Use the reference image as the ground truth for this shot: keep the setting, "
+    "camera position, layout, furniture, objects, colors, and any person's face, build, "
+    "and clothing exactly as they appear in it. Change only what this shot describes. "
+    "Any mirror in it reflects only what is actually in front of it. "
+)
+
+
+def reference_list(timeline: dict) -> list:
+    items = []
+    for item in timeline.get("references") or []:
+        if not isinstance(item, dict) or not REF_RE.fullmatch(str(item.get("id") or "")):
+            continue
+        items.append({
+            "id": item["id"],
+            "name": str(item.get("name") or "Reference")[:60],
+            "image": str(item.get("image") or ""),
+        })
+    return items
+
+
+def reference_state(timeline: dict) -> dict:
+    items = reference_list(timeline)
+    default = str(timeline.get("reference_default") or "")
+    if items and default not in {item["id"] for item in items}:
+        default = items[0]["id"]
+    if not items:
+        default = ""
+    return {"references": items, "default": default}
+
+
+def reference_for(folder: Path, timeline: dict, section: dict):
+    """The reference this shot follows: its own pick, else the project
+    default. "none" turns references off for that one shot."""
+    choice = str(section.get("reference") or "")
+    if choice == "none":
+        return None
+    state = reference_state(timeline)
+    wanted = choice or state["default"]
+    for item in state["references"]:
+        if item["id"] == wanted:
+            try:
+                return still_file(folder, item["image"])
+            except HTTPException:
+                return None
+    return None
+
+
 def store_still(folder: Path, section_id: str, raw: bytes) -> str:
-    ext = "png" if raw.startswith(b"\x89PNG") else "jpg"
+    ext = image_ext(raw) or "jpg"
     stills = folder / "stills"
     stills.mkdir(exist_ok=True)
     for old in stills.glob(section_id + ".*"):
@@ -460,6 +535,9 @@ async def save_timeline(project_id: str, timeline: dict = Body(...)):
     timeline["song"] = current.get("song")
     timeline["song_path"] = current.get("song_path")
     timeline.pop("duration", None)
+    # References change only through their own endpoints.
+    timeline["references"] = current.get("references") or []
+    timeline["reference_default"] = current.get("reference_default") or ""
     if not isinstance(timeline.get("sections"), list):
         timeline["sections"] = []
     previous_roles = {}
@@ -487,61 +565,331 @@ async def save_timeline(project_id: str, timeline: dict = Body(...)):
     return {"ok": True}
 
 
-@app.post("/api/project/{project_id}/transcribe")
-async def transcribe(project_id: str):
+# Whisper output and corrected lyrics are kept per song, keyed by the song's
+# bytes, so the same song is never transcribed twice and fixes carry over to
+# any project that uses it.
+CACHE_DIR = BASE_DIR / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip() or "base"
+_LRC_STAMP = re.compile(r"\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]")
+_TAG_LINE = re.compile(r"^\s*\[[^\]\d][^\]]{0,47}\]\s*$")
+_TOKEN = re.compile(r"[a-z0-9]+")
+
+
+def song_key(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:24]
+
+
+def norm_tokens(text: str) -> list:
+    return _TOKEN.findall(str(text or "").lower().replace("'", "").replace("’", ""))
+
+
+def parse_lrc(text: str) -> list:
+    """Lines from an .lrc file. Empty when the text has no timestamps."""
+    stamped = []
+    for raw in str(text or "").splitlines():
+        stamps = list(_LRC_STAMP.finditer(raw))
+        if not stamps:
+            continue
+        words = _LRC_STAMP.sub("", raw).strip()
+        if not words:
+            continue
+        for stamp in stamps:
+            seconds = int(stamp.group(1)) * 60 + float(stamp.group(2).replace(":", "."))
+            stamped.append((seconds, words))
+    stamped.sort(key=lambda item: item[0])
+    lines = []
+    for index, (start, words) in enumerate(stamped):
+        nxt = stamped[index + 1][0] if index + 1 < len(stamped) else start + 4.0
+        end = max(start + 0.3, min(nxt, start + 8.0))
+        lines.append({"start": round(start, 2), "end": round(end, 2), "text": words, "sure": True})
+    return lines
+
+
+def lyric_rows(text: str) -> list:
+    """Sung lines from pasted lyrics. Section tags like [Chorus] are dropped."""
+    rows = []
+    for raw in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if not line or _TAG_LINE.fullmatch(line):
+            continue
+        rows.append(line[:300])
+    return rows
+
+
+def heard_words(payload: dict) -> list:
+    words = []
+    for segment in payload.get("segments") or []:
+        items = segment.get("words") or []
+        if items:
+            for item in items:
+                for token in norm_tokens(item.get("word")):
+                    words.append((token, float(item.get("start") or 0), float(item.get("end") or 0)))
+            continue
+        # No word times: spread the segment evenly over its words.
+        tokens = norm_tokens(segment.get("text"))
+        if not tokens:
+            continue
+        start = float(segment.get("start") or 0)
+        end = max(start + 0.1, float(segment.get("end") or start))
+        step = (end - start) / len(tokens)
+        for index, token in enumerate(tokens):
+            words.append((token, start + index * step, start + (index + 1) * step))
+    return words
+
+
+def align_lyrics(rows: list, words: list, song_seconds: float) -> list:
+    """Your words, the song's timing.
+
+    Each lyric word that Whisper also heard takes that word's time. Words it
+    misheard or missed sit between the nearest matched words. A line where
+    under half the words matched is marked unsure, so the board can flag it.
+    """
+    import difflib
+
+    tokens = []
+    owner = []
+    for index, row in enumerate(rows):
+        pieces = norm_tokens(row) or ["_"]
+        tokens.extend(pieces)
+        owner.extend([index] * len(pieces))
+    heard = [word[0] for word in words]
+    times = [None] * len(tokens)
+    matched = [False] * len(tokens)
+    blocks = difflib.SequenceMatcher(None, tokens, heard, autojunk=False).get_matching_blocks()
+    for block in blocks:
+        for offset in range(block.size):
+            word = words[block.b + offset]
+            times[block.a + offset] = (word[1], word[2])
+            matched[block.a + offset] = True
+    total = song_seconds if song_seconds > 0 else (words[-1][2] if words else 0.0)
+    total = max(total, 1.0)
+    # Fill unmatched runs between the nearest anchors, in proportion.
+    index = 0
+    while index < len(tokens):
+        if times[index] is not None:
+            index += 1
+            continue
+        run_end = index
+        while run_end < len(tokens) and times[run_end] is None:
+            run_end += 1
+        left = times[index - 1][1] if index > 0 else 0.0
+        right = times[run_end][0] if run_end < len(tokens) else total
+        if right < left:
+            right = left
+        count = run_end - index
+        step = (right - left) / count if count else 0
+        for k in range(count):
+            times[index + k] = (left + k * step, left + (k + 1) * step)
+        index = run_end
+    lines = []
+    for row_index, text in enumerate(rows):
+        spots = [i for i, own in enumerate(owner) if own == row_index]
+        start = times[spots[0]][0]
+        end = times[spots[-1]][1]
+        hits = sum(1 for i in spots if matched[i])
+        lines.append({
+            "start": start,
+            "end": end,
+            "text": text,
+            "sure": hits * 2 >= len(spots),
+        })
+    # Keep lines in order with no overlaps, and never zero length.
+    for index, line in enumerate(lines):
+        if index:
+            line["start"] = max(line["start"], lines[index - 1]["end"])
+        line["end"] = max(line["end"], line["start"] + 0.3)
+        line["start"] = round(line["start"], 2)
+        line["end"] = round(line["end"], 2)
+    return lines
+
+
+async def run_whisper(song: Path, key: str, prompt: str) -> dict:
+    tag = hashlib.sha256(f"{WHISPER_MODEL}\0{prompt}".encode()).hexdigest()[:10]
+    cached = CACHE_DIR / f"{key}.whisper.{tag}.json"
+    if cached.is_file():
+        try:
+            return json.loads(cached.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    out_dir = CACHE_DIR / f"run-{uuid.uuid4().hex[:8]}"
+    out_dir.mkdir()
+    args = [
+        "whisper", str(song),
+        "--model", WHISPER_MODEL,
+        "--device", "cpu",
+        "--fp16", "False",
+        "--word_timestamps", "True",
+        "--output_format", "json",
+        "--output_dir", str(out_dir),
+        "--verbose", "False",
+    ]
+    if prompt:
+        # Knowing the words helps Whisper hear them through the music.
+        args.extend(["--initial_prompt", prompt[:800]])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise HTTPException(504, "Transcription took too long.")
+        if proc.returncode != 0:
+            tail = (stderr or stdout or b"").decode("utf-8", "replace").strip().splitlines()
+            detail = tail[-1][:300] if tail else "Whisper failed."
+            raise HTTPException(500, detail)
+        found = list(out_dir.glob("*.json"))
+        if not found:
+            raise HTTPException(500, "Whisper did not write a transcript.")
+        payload = json.loads(found[0].read_text(encoding="utf-8"))
+    finally:
+        for leftover in out_dir.glob("*"):
+            leftover.unlink()
+        out_dir.rmdir()
+    cached.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def saved_lyrics_path(key: str) -> Path:
+    return CACHE_DIR / f"{key}.lyrics.json"
+
+
+def clean_lines(value) -> list:
+    lines = []
+    if not isinstance(value, list):
+        return lines
+    for item in value[:2000]:
+        if not isinstance(item, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()[:300]
+        if not text:
+            continue
+        try:
+            start = float(item.get("start") or 0)
+            end = float(item.get("end") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(start) and math.isfinite(end)) or start < 0 or end < start:
+            continue
+        lines.append({
+            "start": round(start, 2),
+            "end": round(end, 2),
+            "text": text,
+            "sure": item.get("sure") is not False,
+        })
+    return lines
+
+
+def write_lyrics(folder: Path, key: str, lines: list, source: str) -> dict:
+    record = {"song": key, "source": source, "lines": lines}
+    blob = json.dumps(record, indent=2)
+    saved_lyrics_path(key).write_text(blob, encoding="utf-8")
+    (folder / "lyrics.json").write_text(blob, encoding="utf-8")
+    # transcript.json is what the phone client and older boards read.
+    (folder / "transcript.json").write_text(
+        json.dumps({"text": " ".join(line["text"] for line in lines), "lines": lines}, indent=2),
+        encoding="utf-8",
+    )
+    return record
+
+
+@app.get("/api/project/{project_id}/lyrics")
+async def get_lyrics(project_id: str):
+    # The lyrics last saved for this song, from any project that used it.
     folder = project_folder(project_id)
     timeline = read_timeline(folder)
     song = song_file(folder, timeline)
-    proc = await asyncio.create_subprocess_exec(
-        "whisper",
-        str(song),
-        "--model",
-        "base",
-        "--device",
-        "cpu",
-        "--fp16",
-        "False",
-        "--output_format",
-        "json",
-        "--output_dir",
-        str(folder),
-        "--verbose",
-        "False",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    key = await asyncio.to_thread(song_key, song)
+    path = saved_lyrics_path(key)
+    if not path.is_file():
+        return {"lines": [], "source": ""}
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1200)
-    except asyncio.TimeoutError:
-        proc.kill()
-        raise HTTPException(504, "Transcription took too long.")
-    if proc.returncode != 0:
-        tail = (stderr or stdout or b"").decode("utf-8", "replace").strip().splitlines()
-        detail = tail[-1][:300] if tail else "Whisper failed."
-        raise HTTPException(500, detail)
-    transcript_path = folder / f"{song.stem}.json"
-    if not transcript_path.is_file():
-        raise HTTPException(500, "Whisper did not write a transcript.")
-    payload = json.loads(transcript_path.read_text(encoding="utf-8"))
-    lines = []
-    for segment in payload.get("segments") or []:
-        text = str(segment.get("text") or "").strip()
-        if not text:
-            continue
-        lines.append({
-            "start": round(float(segment.get("start") or 0), 2),
-            "end": round(float(segment.get("end") or 0), 2),
-            "text": text,
-        })
-    clean = {"text": str(payload.get("text") or "").strip(), "lines": lines}
-    (folder / "transcript.json").write_text(json.dumps(clean, indent=2), encoding="utf-8")
-    return {"lines": lines, "text": clean["text"]}
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"lines": [], "source": ""}
+    return {"lines": clean_lines(record.get("lines")), "source": str(record.get("source") or "")}
+
+
+@app.post("/api/project/{project_id}/lyrics")
+async def save_lyrics(project_id: str, body: dict = Body(...)):
+    # Board only. Called after every correction, so a fix is made once.
+    folder = project_folder(project_id)
+    timeline = read_timeline(folder)
+    song = song_file(folder, timeline)
+    key = await asyncio.to_thread(song_key, song)
+    lines = clean_lines((body or {}).get("lines"))
+    source = str((body or {}).get("source") or "edited")[:20]
+    write_lyrics(folder, key, lines, source)
+    return {"ok": True, "lines": len(lines)}
+
+
+@app.post("/api/project/{project_id}/transcribe")
+async def transcribe(project_id: str, body: dict | None = Body(default=None)):
+    """Timed lyric lines for the song.
+
+    With lyrics in the body: an .lrc file is used as it is, and plain text is
+    matched to the song's audio, so the words are yours and the times are
+    the song's. With no body: Whisper's own words. Whisper runs once per song
+    (and per lyric sheet); after that the result comes from the cache.
+    """
+    folder = project_folder(project_id)
+    timeline = read_timeline(folder)
+    song = song_file(folder, timeline)
+    body = body if isinstance(body, dict) else {}
+    lyrics = str(body.get("lyrics") or "")[:20000]
+    key = await asyncio.to_thread(song_key, song)
+    lrc = parse_lrc(lyrics)
+    if lrc:
+        record = write_lyrics(folder, key, lrc, "lrc")
+        return {"lines": record["lines"], "text": " ".join(line["text"] for line in lrc), "source": "lrc", "unsure": 0}
+    rows = lyric_rows(lyrics)
+    prompt = " ".join(rows) if rows else ""
+    payload = await run_whisper(song, key, prompt)
+    if rows:
+        try:
+            seconds = await media_duration(song)
+        except HTTPException:
+            seconds = 0.0
+        lines = align_lyrics(rows, heard_words(payload), seconds)
+        source = "aligned"
+    else:
+        lines = []
+        for segment in payload.get("segments") or []:
+            text = str(segment.get("text") or "").strip()
+            if not text:
+                continue
+            lines.append({
+                "start": round(float(segment.get("start") or 0), 2),
+                "end": round(float(segment.get("end") or 0), 2),
+                "text": text,
+                "sure": True,
+            })
+        source = "whisper"
+    if not lines:
+        raise HTTPException(500, "Whisper returned no lines.")
+    record = write_lyrics(folder, key, lines, source)
+    unsure = sum(1 for line in record["lines"] if not line["sure"])
+    return {
+        "lines": record["lines"],
+        "text": " ".join(line["text"] for line in record["lines"]),
+        "source": source,
+        "unsure": unsure,
+    }
 
 
 @app.post("/api/suggest-prompt")
 async def suggest_prompt(body: dict = Body(...)):
     lyrics = str(body.get("lyrics") or "").strip()
-    if len(lyrics) < 2:
+    broll = body.get("broll") is True
+    if len(lyrics) < 2 and not broll:
         raise HTTPException(400, "Drop some lyrics first.")
     key = api_key()
     if not key:
@@ -553,19 +901,49 @@ async def suggest_prompt(body: dict = Body(...)):
         bit = ", ".join(piece for piece in (person["name"], person["look"]) if piece)
         if bit:
             characters.append(bit)
-    user = "\n".join([
-        "Feel: " + (feel or "unspecified"),
-        "Master direction: " + (master or "none"),
-        "Characters: " + ("; ".join(characters) or "none"),
-        "Lyrics: " + lyrics[:1500],
-    ])
-    system = (
-        "You write one image prompt for a music-video still. "
-        "Describe what the camera sees in this lyric span, in one or two sentences. "
-        "Fit the feel and characters when they are given. "
-        "Do not quote the lyrics. Do not add a title, labels, or quotation marks. "
-        "No readable text in the scene. Keep figures distant."
-    )
+    if broll:
+        # An instrumental stretch with no words of its own. The shot belongs
+        # to the lines around it and must not repeat its neighbours.
+        before = str(body.get("before") or "").strip()[:600]
+        after = str(body.get("after") or "").strip()[:600]
+        avoid = [str(item).strip()[:300] for item in (body.get("avoid") or []) if str(item).strip()][:6]
+        try:
+            index = max(1, int(body.get("index") or 1))
+            total = max(index, int(body.get("total") or 1))
+        except (TypeError, ValueError):
+            index, total = 1, 1
+        user = "\n".join([
+            "Feel: " + (feel or "unspecified"),
+            "Master direction: " + (master or "none"),
+            "Characters: " + ("; ".join(characters) or "none"),
+            "Lyrics just before: " + (before or "none, this is the opening"),
+            "Lyrics just after: " + (after or "none, this is the ending"),
+            f"Shot {index} of {total} in this instrumental stretch.",
+            "Already used here: " + (" | ".join(avoid) or "nothing yet"),
+        ])
+        system = (
+            "You write one image prompt for a B-roll still in an instrumental part of a music video. "
+            "Show the world of the song between the words: the setting, a telling detail, the light, "
+            "or the characters in a quiet moment. Stay in the same place and story as the lyrics around it. The feel, room, and character are added separately, so do not repeat them. "
+            "Make it clearly different from anything already used: change the subject, angle, or distance. "
+            "One or two sentences describing what the camera sees. "
+            "Do not quote lyrics. Do not add a title, labels, or quotation marks. "
+            "No readable text in the scene. Keep figures distant."
+        )
+    else:
+        user = "\n".join([
+            "Feel: " + (feel or "unspecified"),
+            "Master direction: " + (master or "none"),
+            "Characters: " + ("; ".join(characters) or "none"),
+            "Lyrics: " + lyrics[:1500],
+        ])
+        system = (
+            "You write one image prompt for a music-video still. "
+            "Describe what the camera sees in this lyric span, in one or two sentences. "
+            "Describe only what is specific to this shot: pose, action, framing, and anything about the room or light that differs. The feel, room, and character are added separately, so do not repeat them. "
+            "Do not quote the lyrics. Do not add a title, labels, or quotation marks. "
+            "No readable text in the scene. Keep figures distant."
+        )
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             "https://api.x.ai/v1/responses",
@@ -625,10 +1003,20 @@ async def generate_image(project_id: str, section_id: str, body: dict = Body(...
         role = str(body.get("role") or "").strip()
         if role in CARD_ROLES:
             section["role"] = role
-        prompt = compose_prompt(timeline, section)
+        if "reference" in body:
+            pick = str(body.get("reference") or "")
+            if pick and pick != "none" and not REF_RE.fullmatch(pick):
+                pick = ""
+            section["reference"] = pick
+        reference = reference_for(folder, timeline, section)
+        prompt = compose_prompt(timeline, section, with_master=reference is None)
         if len(prompt.strip()) < 8:
             raise HTTPException(400, "Write a prompt or drop lyrics onto this shot first.")
-        raw = await imagine(prompt)
+        cost = IMAGE_COST
+        if reference is not None:
+            prompt = REF_LEAD + prompt[: 2000 - len(REF_LEAD)]
+            cost = round(IMAGE_COST + IMAGE_INPUT_COST, 3)
+        raw = await imagine(prompt, reference)
         if len(raw) < 500:
             raise HTTPException(502, "Imagine returned an empty image.")
         section["image"] = store_still(folder, section_id, raw)
@@ -639,7 +1027,8 @@ async def generate_image(project_id: str, section_id: str, body: dict = Body(...
             "id": section_id,
             "url": section["image"],
             "prompt": prompt,
-            "cost": IMAGE_COST,
+            "cost": cost,
+            "reference": bool(reference),
         }
     finally:
         _inflight.discard(token)
@@ -677,6 +1066,140 @@ async def upload_stills(project_id: str, files: list[UploadFile] = File(...)):
         })
     print(f"upload {project_id} {len(saved)} stills", flush=True)
     return {"stills": saved}
+
+
+def save_reference(folder: Path, timeline: dict, raw: bytes, name: str) -> dict:
+    ref_id = "r" + uuid.uuid4().hex[:6]
+    url = store_still(folder, ref_id, raw)
+    items = reference_list(timeline)
+    items.append({"id": ref_id, "name": (name or "").strip()[:60] or f"Reference {len(items) + 1}", "image": url})
+    timeline["references"] = items
+    if not timeline.get("reference_default") or len(items) == 1:
+        timeline["reference_default"] = ref_id
+    write_timeline(folder, timeline)
+    return reference_state(timeline)
+
+
+@app.get("/api/project/{project_id}/references")
+async def get_references(project_id: str):
+    return reference_state(read_timeline(project_folder(project_id)))
+
+
+@app.post("/api/project/{project_id}/references/generate")
+async def generate_reference(project_id: str, body: dict = Body(...)):
+    # A reference is drawn from scratch. Blank prompt: the setting from the
+    # master prompt with nobody in it, ready for every shot to build on.
+    folder = project_folder(project_id)
+    timeline = read_timeline(folder)
+    body = body if isinstance(body, dict) else {}
+    feel = str(body.get("feel") if "feel" in body else timeline.get("feel") or "").strip()[:1000]
+    master = str(body.get("master_prompt") if "master_prompt" in body else timeline.get("master_prompt") or "").strip()[:2000]
+    wanted = str(body.get("prompt") or "").strip()[:1500]
+    parts = [piece for piece in (feel, master) if piece]
+    if wanted:
+        parts.append(wanted)
+    else:
+        parts.append("Establishing shot of the setting, empty, with no people in it")
+    parts.append("Reference image, cinematic 16:9 still, clear and well composed, no readable text, no logos")
+    prompt = ". ".join(part.rstrip(" .") for part in parts)[:2000]
+    if len(prompt) < 40 and not wanted:
+        raise HTTPException(400, "Describe the reference, or fill in the master prompt first.")
+    raw = await imagine(prompt)
+    if len(raw) < 500:
+        raise HTTPException(502, "Imagine returned an empty image.")
+    timeline = read_timeline(folder)
+    state = save_reference(folder, timeline, raw, str(body.get("name") or ""))
+    print(f"reference {project_id} generated", flush=True)
+    return {**state, "cost": IMAGE_COST, "prompt": prompt}
+
+
+@app.post("/api/project/{project_id}/references/upload")
+async def upload_reference(project_id: str, file: UploadFile = File(...), name: str = Form("")):
+    folder = project_folder(project_id)
+    raw = await file.read()
+    if len(raw) > MAX_STILL:
+        raise HTTPException(413, "The image must be 20 MB or smaller.")
+    if not image_ext(raw):
+        raise HTTPException(400, "Use a JPEG, PNG, or WebP.")
+    base = Path(file.filename or "").stem[:60]
+    return save_reference(folder, read_timeline(folder), raw, name or base)
+
+
+@app.post("/api/project/{project_id}/references/from-still")
+async def reference_from_still(project_id: str, body: dict = Body(...)):
+    # Any still on the board can become a reference.
+    folder = project_folder(project_id)
+    path = still_file(folder, str((body or {}).get("image") or ""))
+    return save_reference(folder, read_timeline(folder), path.read_bytes(), str((body or {}).get("name") or ""))
+
+
+@app.post("/api/project/{project_id}/references/{ref_id}/edit")
+async def edit_reference(project_id: str, ref_id: str, body: dict = Body(...)):
+    # Change one reference with words. The result is saved as a new
+    # reference next to the old one, so nothing is lost if the edit misses.
+    if not REF_RE.fullmatch(ref_id):
+        raise HTTPException(404, "Reference not found")
+    folder = project_folder(project_id)
+    timeline = read_timeline(folder)
+    item = next((entry for entry in reference_list(timeline) if entry["id"] == ref_id), None)
+    if item is None:
+        raise HTTPException(404, "Reference not found")
+    wanted = str((body or {}).get("prompt") or "").strip()[:1500]
+    if len(wanted) < 4:
+        raise HTTPException(400, "Say what to change.")
+    source = still_file(folder, item["image"])
+    prompt = (
+        "Edit this image. Change only what is described here and keep everything else exactly "
+        "the same: the camera position, the layout, the light, and every object. " + wanted
+    )
+    raw = await imagine(prompt, source)
+    if len(raw) < 500:
+        raise HTTPException(502, "Imagine returned an empty image.")
+    name = str((body or {}).get("name") or "").strip()[:60] or (item["name"][:52] + " (edit)")
+    state = save_reference(folder, read_timeline(folder), raw, name)
+    state["new_id"] = state["references"][-1]["id"]
+    state["cost"] = round(IMAGE_COST + IMAGE_INPUT_COST, 3)
+    print(f"reference {project_id} {ref_id} edited", flush=True)
+    return state
+
+
+@app.post("/api/project/{project_id}/references/{ref_id}")
+async def update_reference(project_id: str, ref_id: str, body: dict = Body(...)):
+    if not REF_RE.fullmatch(ref_id):
+        raise HTTPException(404, "Reference not found")
+    folder = project_folder(project_id)
+    timeline = read_timeline(folder)
+    items = reference_list(timeline)
+    item = next((entry for entry in items if entry["id"] == ref_id), None)
+    if item is None:
+        raise HTTPException(404, "Reference not found")
+    if "name" in (body or {}):
+        item["name"] = str(body.get("name") or "").strip()[:60] or item["name"]
+    if (body or {}).get("default") is True:
+        timeline["reference_default"] = ref_id
+    timeline["references"] = items
+    write_timeline(folder, timeline)
+    return reference_state(timeline)
+
+
+@app.delete("/api/project/{project_id}/references/{ref_id}")
+async def delete_reference(project_id: str, ref_id: str):
+    if not REF_RE.fullmatch(ref_id):
+        raise HTTPException(404, "Reference not found")
+    folder = project_folder(project_id)
+    timeline = read_timeline(folder)
+    items = [entry for entry in reference_list(timeline) if entry["id"] != ref_id]
+    timeline["references"] = items
+    if timeline.get("reference_default") == ref_id:
+        timeline["reference_default"] = items[0]["id"] if items else ""
+    for section in timeline.get("sections") or []:
+        if isinstance(section, dict) and section.get("reference") == ref_id:
+            section["reference"] = ""
+    for old in (folder / "stills").glob(ref_id + ".*"):
+        if STILL_RE.fullmatch(old.name):
+            old.unlink()
+    write_timeline(folder, timeline)
+    return reference_state(timeline)
 
 
 @app.delete("/api/project/{project_id}/stills/{filename}")
@@ -1055,6 +1578,77 @@ async def generated_audio(filename: str):
     return FileResponse(path)
 
 
+BEATS_VERSION = 1
+_beats_lock = asyncio.Lock()
+
+
+def detect_beats(path: Path) -> dict:
+    # Runs in a worker thread. librosa is optional: without it the board
+    # still fills gaps, it just cuts on even spacing instead of on the beat.
+    import librosa
+    import numpy as np
+
+    y, sr = librosa.load(str(path), sr=22050, mono=True)
+    onset = librosa.onset.onset_strength(y=y, sr=sr)
+    tempo, frames = librosa.beat.beat_track(onset_envelope=onset, sr=sr, units="frames")
+    frames = np.asarray(frames, dtype=int)
+    times = librosa.frames_to_time(frames, sr=sr)
+    bars = []
+    if len(frames) >= 4:
+        # A bar line is the beat of every four that hits hardest.
+        strength = [float(onset[frames[phase::4]].sum()) for phase in range(4)]
+        best = int(max(range(4), key=lambda phase: strength[phase]))
+        bars = [round(float(t), 3) for t in times[best::4]]
+    return {
+        "available": True,
+        "tempo": round(float(np.atleast_1d(tempo)[0]), 1),
+        "beats": [round(float(t), 3) for t in times],
+        "bars": bars,
+    }
+
+
+@app.get("/api/project/{project_id}/beats")
+async def song_beats(project_id: str):
+    folder = project_folder(project_id)
+    timeline = read_timeline(folder)
+    song = song_file(folder, timeline)
+    stat = song.stat()
+    key = f"{BEATS_VERSION}:{song.name}:{stat.st_size}:{int(stat.st_mtime)}"
+    cache = folder / "beats.json"
+    async with _beats_lock:
+        if cache.is_file():
+            try:
+                saved = json.loads(cache.read_text(encoding="utf-8"))
+                if saved.get("key") == key:
+                    return saved["result"]
+            except (OSError, json.JSONDecodeError, KeyError):
+                pass
+        try:
+            import librosa  # noqa: F401
+        except ImportError:
+            return {
+                "available": False,
+                "tempo": 0,
+                "beats": [],
+                "bars": [],
+                "note": "Install librosa on this machine to cut on the beat.",
+            }
+        try:
+            result = await asyncio.to_thread(detect_beats, song)
+        except Exception as exc:
+            print(f"beats {project_id} failed: {type(exc).__name__}", flush=True)
+            return {
+                "available": False,
+                "tempo": 0,
+                "beats": [],
+                "bars": [],
+                "note": "Could not find the beat in this song.",
+            }
+        cache.write_text(json.dumps({"key": key, "result": result}), encoding="utf-8")
+        print(f"beats {project_id} {result['tempo']} bpm {len(result['beats'])} beats", flush=True)
+        return result
+
+
 CLIP_NAME_RE = re.compile(r"^([A-Za-z0-9_-]{1,40})_(\d+)\.mp4$")
 
 
@@ -1114,6 +1708,132 @@ async def motion_clip(project_id: str, section_id: str, index: int):
     )
 
 
+FIX_SYSTEM = """You help fix one shot of a music video, inside OmniVideo, a board that turns a song into a video.
+
+How the board builds a still: it joins the Overall feel, the Master prompt, the Characters, and then the card's own prompt into one image prompt. So the card prompt must describe ONLY what is specific to this shot: who is where, their pose and action, the framing and camera angle, the light if it differs, and anything unusual. Never repeat the feel, the room, or the character's look; the board adds those.
+
+References: a reference image makes the still an edit of that picture, keeping its setting, camera position, objects, and people the same. Good for keeping places consistent. But it holds the camera where the reference was taken, so a shot with a different angle or framing (a close-up, over-the-shoulder, overhead, a mirror detail) usually needs reference "none". Choose "default" to follow the project default, "none" to draw from scratch, or the id of a named reference.
+
+Motion: the clip made from the still follows its own motion prompt. Describe only movement over a few seconds: what moves, how, and what stays still. Leave it empty to keep the current one.
+
+Image models get confused by things like "only in the reflection": name the framing explicitly, say what is in the foreground and background, and repeat a hard rule once in plain words.
+
+Reply with ONLY a JSON object, no other text:
+{"reply": "one or two short sentences to the user about what you changed and why", "prompt": "the full new card prompt", "reference": "default" or "none" or a reference id, "motion": "new motion prompt, or empty string to keep it"}"""
+
+
+def find_json(text: str) -> dict:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        value = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+@app.post("/api/project/{project_id}/sections/{section_id}/fix")
+async def fix_shot(project_id: str, section_id: str, body: dict = Body(...)):
+    """Chat about one still. Grok rewrites the card's prompt, reference and
+    motion; the board shows the proposal and the user applies it."""
+    if not SECTION_RE.fullmatch(section_id):
+        raise HTTPException(400, "Bad section id.")
+    key = api_key()
+    if not key:
+        raise HTTPException(400, "No API key is available on this machine.")
+    folder = project_folder(project_id)
+    timeline = read_timeline(folder)
+    body = body if isinstance(body, dict) else {}
+    message = str(body.get("message") or "").strip()[:2000]
+    if not message:
+        raise HTTPException(400, "Say what's wrong with this shot.")
+    feel = str(body.get("feel") or timeline.get("feel") or "").strip()[:1000]
+    master = str(body.get("master_prompt") or timeline.get("master_prompt") or "").strip()[:2000]
+    people = []
+    for person in clean_characters(body.get("characters") if "characters" in body else timeline.get("characters")):
+        bit = ", ".join(piece for piece in (person["name"], person["look"]) if piece)
+        if bit:
+            people.append(bit)
+    refs = reference_state(timeline)
+    ref_lines = [
+        f'- id "{item["id"]}": {item["name"]}' + (" (the default)" if item["id"] == refs["default"] else "")
+        for item in refs["references"]
+    ]
+    current_ref = str(body.get("reference") or "")
+    context = "\n".join([
+        "Overall feel: " + (feel or "none"),
+        "Master prompt: " + (master or "none"),
+        "Characters: " + ("; ".join(people) or "none"),
+        "References:\n" + ("\n".join(ref_lines) or "none yet"),
+        "This shot's lyrics: " + (str(body.get("lyrics") or "").strip()[:600] or "none (instrumental)"),
+        "This shot's current prompt: " + (str(body.get("prompt") or "").strip()[:1500] or "empty"),
+        "This shot's current reference: " + (current_ref or "default"),
+        "This shot's current motion prompt: " + (str(body.get("motion") or "").strip()[:800] or "empty"),
+    ])
+    turns = [{"role": "system", "content": FIX_SYSTEM}, {"role": "user", "content": "Shot details:\n" + context}]
+    for item in (body.get("history") or [])[-12:]:
+        if not isinstance(item, dict):
+            continue
+        role = "assistant" if item.get("role") == "assistant" else "user"
+        text = str(item.get("content") or "").strip()[:2000]
+        if text:
+            turns.append({"role": role, "content": text})
+    ask = [{"type": "input_text", "text": message}]
+    looked = False
+    if body.get("look") is True:
+        # Let the model see the still it is fixing.
+        image = str(body.get("image") or "").split("?", 1)[0]
+        if image:
+            try:
+                path = still_file(folder, image)
+                ask.append({
+                    "type": "input_image",
+                    "image_url": "data:" + image_mime(path) + ";base64," + base64.b64encode(path.read_bytes()).decode("ascii"),
+                })
+                looked = True
+            except HTTPException:
+                pass
+    turns.append({"role": "user", "content": ask})
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            "https://api.x.ai/v1/responses",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": TEXT_MODEL,
+                "store": False,
+                "max_output_tokens": 700,
+                "input": turns,
+            },
+        )
+    if response.status_code >= 400:
+        raise HTTPException(response.status_code, error_text(response, "Could not reach Grok."))
+    raw = response_text(response.json())
+    data = find_json(raw)
+    prompt = str(data.get("prompt") or "").strip().strip('"')[:2000]
+    if not prompt:
+        reply = (raw or "").strip()[:600] or "No answer came back. Try saying it another way."
+        return {"reply": reply, "prompt": "", "reference": current_ref, "motion": "", "looked": looked}
+    pick = str(data.get("reference") or "default").strip()
+    if pick == "default":
+        pick = ""
+    elif pick != "none" and pick not in {item["id"] for item in refs["references"]}:
+        pick = current_ref if current_ref == "none" or REF_RE.fullmatch(current_ref) else ""
+    return {
+        "reply": str(data.get("reply") or "Here's a new version.").strip()[:600],
+        "prompt": prompt,
+        "reference": pick,
+        "motion": str(data.get("motion") or "").strip()[:800],
+        "looked": looked,
+    }
+
+
 @app.post("/api/suggest-lyrics")
 async def suggest_lyrics(body: dict = Body(...)):
     style = str((body or {}).get("prompt") or (body or {}).get("style") or "").strip()
@@ -1150,6 +1870,14 @@ async def suggest_lyrics(body: dict = Body(...)):
     if not text:
         raise HTTPException(502, "No lyrics came back.")
     return {"lyrics": text[:2000]}
+
+
+@app.get("/api/project/{project_id}/song")
+async def project_song(project_id: str):
+    # The board's player. FileResponse answers range requests, so seeking works.
+    folder = project_folder(project_id)
+    song = song_file(folder, read_timeline(folder))
+    return FileResponse(song, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/project/{project_id}/stills/{filename}")
@@ -1233,6 +1961,18 @@ def clip_digest(image: Path, duration: int, prompt: str) -> str:
     return digest.hexdigest()
 
 
+def chain_digest(prev: str, duration: int, prompt: str) -> str:
+    # A piece after the first starts from the last frame of the piece before
+    # it, so a long shot keeps moving instead of jumping back to the still.
+    # That frame does not exist until the earlier piece is made, so the cache
+    # key follows the earlier piece's key instead of image bytes.
+    digest = hashlib.sha256()
+    for part in (VIDEO_MODEL, VIDEO_RESOLUTION, str(duration), prompt, "chain", prev):
+        digest.update(part.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def cached_clip(folder: Path, section_id: str, index: int, digest: str):
     path = folder / "clips" / f"{section_id}_{index}.mp4"
     meta_path = path.with_suffix(".json")
@@ -1263,7 +2003,9 @@ def board_timeline(saved: dict, body: dict) -> dict:
     }
 
 
-def build_video_plan(folder: Path, timeline: dict, song_seconds: float) -> dict:
+def build_video_plan(folder: Path, timeline: dict, song_seconds: float, partial: bool = False) -> dict:
+    # partial: the Frames reel asks before every shot has a still. Shots with
+    # no still keep their place on the clock but get no pieces.
     raw = []
     missing = 0
     seen = set()
@@ -1281,17 +2023,25 @@ def build_video_plan(folder: Path, timeline: dict, song_seconds: float) -> dict:
         if end <= start:
             raise HTTPException(400, "A shot ends before it starts.")
         image = str(section.get("image") or "").strip()
-        if not image:
+        still = None
+        if image:
+            try:
+                still = still_file(folder, image)
+            except HTTPException:
+                if not partial:
+                    raise
+        if still is None:
             missing += 1
-            continue
+            if not partial:
+                continue
         raw.append({
             "id": section_id,
             "start": start,
             "end": end,
-            "image": still_file(folder, image),
+            "image": still,
             "prompt": motion_prompt(timeline, section),
         })
-    if missing:
+    if missing and not partial:
         noun = "is" if missing == 1 else "are"
         raise HTTPException(400, f"Every shot needs an image first. {missing} {noun} still empty.")
     if not raw:
@@ -1303,22 +2053,31 @@ def build_video_plan(folder: Path, timeline: dict, song_seconds: float) -> dict:
     song_end = song_seconds if song_seconds > 0 else raw[-1]["end"]
     if song_end < raw[-1]["end"]:
         song_end = raw[-1]["end"]
+    # Every second of the song gets moving video. The first shot starts at
+    # 0:00 and each shot runs until the next one starts, the last one to the
+    # end of the song. A gap the board left open is played by the shot before
+    # it (billed), never by a frozen frame. Fill gaps on the board turns long
+    # gaps into B-roll cards instead.
     shots = []
-    cursor = 0.0
     clip_count = 0
     cached = 0
     bill_seconds = 0
+    stretched = 0.0
     for index, shot in enumerate(raw):
-        lead = round(max(0.0, shot["start"] - cursor), 3)
-        span = round(shot["end"] - shot["start"], 3)
+        start = 0.0 if index == 0 else shot["start"]
+        next_time = raw[index + 1]["start"] if index + 1 < len(raw) else song_end
+        span = round(next_time - start, 3)
         if span <= 0:
             span = 0.05
-        next_time = raw[index + 1]["start"] if index + 1 < len(raw) else song_end
-        tail = max(0.0, next_time - shot["end"])
-        cursor = next_time
+        stretched += max(0.0, span - (shot["end"] - shot["start"]))
         pieces = []
-        for piece_index, duration in enumerate(clip_pieces(span)):
-            digest = clip_digest(shot["image"], duration, shot["prompt"])
+        prev_digest = ""
+        for piece_index, duration in enumerate(clip_pieces(span) if shot["image"] else []):
+            if piece_index == 0:
+                digest = clip_digest(shot["image"], duration, shot["prompt"])
+            else:
+                digest = chain_digest(prev_digest, duration, shot["prompt"])
+            prev_digest = digest
             hit = cached_clip(folder, shot["id"], piece_index, digest)
             pieces.append({
                 "index": piece_index,
@@ -1334,9 +2093,11 @@ def build_video_plan(folder: Path, timeline: dict, song_seconds: float) -> dict:
                 bill_seconds += duration
         shots.append({
             "id": shot["id"],
-            "lead": round(lead, 3),
+            "start": round(start, 3),
+            "end": round(next_time, 3),
+            "lead": 0.0,
             "span": round(span, 3),
-            "tail": round(tail, 3),
+            "tail": 0.0,
             "image": shot["image"],
             "prompt": shot["prompt"],
             "pieces": pieces,
@@ -1344,22 +2105,24 @@ def build_video_plan(folder: Path, timeline: dict, song_seconds: float) -> dict:
     if clip_count > MAX_CLIPS:
         raise HTTPException(400, f"That is {clip_count} clips. Keep it to {MAX_CLIPS} or fewer.")
     new_clips = clip_count - cached
-    cost = round(bill_seconds * VIDEO_RATE + 1e-9, 2)
-    hold = round(song_end - sum(item["end"] - item["start"] for item in raw), 2)
+    cost = video_cost(bill_seconds, new_clips)
+    stretched = round(stretched, 2)
     if new_clips == 0:
         note = "These clips are already made. Assembling the video does not call the video service."
     else:
         clip_word = "clip" if new_clips == 1 else "clips"
         cached_note = f"{cached} already made. " if cached else ""
         hold_note = ""
-        if hold > 0.25:
+        if stretched > 0.25:
             hold_note = (
-                f" About {hold:.0f}s of the song holds the current picture and is not billed."
+                f" About {stretched:.0f}s of gaps are covered by running the shot before"
+                " each gap longer. Fill gaps on the board turns them into B-roll instead."
             )
         note = (
             f"{cached_note}{new_clips} new {clip_word}, {bill_seconds} seconds of "
             f"{VIDEO_MODEL} at {VIDEO_RESOLUTION}. "
-            f"Estimated cost ${cost:.2f} at ${VIDEO_RATE:.2f} per second."
+            f"Estimated cost ${cost:.2f} (${VIDEO_RATE:.2f} per second plus "
+            f"${VIDEO_IMAGE_COST:.2f} per clip)."
             f"{hold_note} Your song replaces the model's audio."
         )
     return {
@@ -1372,8 +2135,13 @@ def build_video_plan(folder: Path, timeline: dict, song_seconds: float) -> dict:
         "cached": cached,
         "bill_seconds": bill_seconds,
         "cost": cost,
+        "stretched": stretched,
         "note": note,
     }
+
+
+def video_cost(seconds: float, clips: int) -> float:
+    return round(seconds * VIDEO_RATE + clips * VIDEO_IMAGE_COST + 1e-9, 2)
 
 
 def public_plan(plan: dict) -> dict:
@@ -1423,8 +2191,9 @@ def video_frames(seconds: float) -> int:
 def video_graph(shots: list, song_index: int, song_seconds: float) -> str:
     # A duration on tpad adds no frames when the clip has no frame duration,
     # and cloned frames reuse one timestamp, so the muxer drops every hold.
-    # Count 24 fps frames, then renumber them. The lyric window is the only
-    # part that plays the clip. The gaps hold that shot's picture.
+    # Count 24 fps frames, then renumber them. build_video_plan already
+    # stretches each shot to the next one, so lead and tail are zero and
+    # nothing here holds a frozen picture.
     parts = []
     labels = []
     cursor = 0
@@ -1540,9 +2309,28 @@ def video_step(project_id: str, step: str, done: int) -> None:
     _video_job["done"] = done
 
 
-async def render_clip(client: httpx.AsyncClient, key: str, shot: dict, piece: dict, project_id: str, done: int, total: int) -> None:
+async def last_frame(clip: Path, dest: Path) -> Path:
+    # The final frame of a finished piece seeds the next piece of the same shot.
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-sseof", "-0.25", "-i", str(clip),
+        "-update", "1", "-q:v", "2", str(dest),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise HTTPException(500, "Could not read the end of a clip.")
+    if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size < 500:
+        raise HTTPException(500, "Could not read the end of a clip.")
+    return dest
+
+
+async def render_clip(client: httpx.AsyncClient, key: str, shot: dict, piece: dict, project_id: str, done: int, total: int, image: Path) -> None:
     video_step(project_id, f"Clip {done + 1} of {total}", done)
-    raw = shot["image"].read_bytes()
+    raw = image.read_bytes()
     payload = {
         "model": VIDEO_MODEL,
         "prompt": shot["prompt"],
@@ -1550,7 +2338,7 @@ async def render_clip(client: httpx.AsyncClient, key: str, shot: dict, piece: di
         "resolution": VIDEO_RESOLUTION,
         "generate_audio": False,
         "image": {
-            "url": "data:" + image_mime(shot["image"]) + ";base64," + base64.b64encode(raw).decode("ascii"),
+            "url": "data:" + image_mime(image) + ";base64," + base64.b64encode(raw).decode("ascii"),
         },
     }
     headers = {"Authorization": f"Bearer {key}"}
@@ -1626,12 +2414,16 @@ async def run_video(project_id: str, plan: dict, song: Path) -> None:
         timeout = httpx.Timeout(30.0, read=180.0, write=180.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             for shot in plan["shots"]:
-                for piece in shot["pieces"]:
+                for position, piece in enumerate(shot["pieces"]):
                     if piece["cached"]:
                         video_step(project_id, f"Clip {done + 1} of {total}, already made.", done)
                         done += 1
                         continue
-                    await render_clip(client, key, shot, piece, project_id, done, total)
+                    image = shot["image"]
+                    if position > 0:
+                        before = shot["pieces"][position - 1]["path"]
+                        image = await last_frame(before, before.with_name(before.stem + "_end.jpg"))
+                    await render_clip(client, key, shot, piece, project_id, done, total, image)
                     done += 1
                     video_step(project_id, f"Clip {done} of {total} ready.", done)
         video_step(project_id, "Assembling the video.", done)
@@ -1682,14 +2474,168 @@ async def run_video(project_id: str, plan: dict, song: Path) -> None:
         print(f"video {project_id} failed: {type(exc).__name__}", flush=True)
 
 
-async def prepare_video(project_id: str, body: dict) -> tuple:
+async def prepare_video(project_id: str, body: dict, partial: bool = False) -> tuple:
     folder = project_folder(project_id)
     saved = read_timeline(folder)
     song = song_file(folder, saved)
     timeline = board_timeline(saved, body or {})
     duration = await media_duration(song)
-    plan = build_video_plan(folder, timeline, duration)
+    plan = build_video_plan(folder, timeline, duration, partial=partial)
     return folder, song, plan
+
+
+def clip_url(project_id: str, shot_id: str, piece: dict) -> str:
+    # The hash on the end changes when the clip is remade, so the browser
+    # never plays an old take from its cache.
+    return (
+        f"/api/project/{quote(project_id, safe='')}/clips/{shot_id}/{piece['index']}"
+        f"?v={piece['hash'][:10]}"
+    )
+
+
+def clip_rows(project_id: str, plan: dict) -> list:
+    rows = []
+    for shot in plan["shots"]:
+        pieces = shot["pieces"]
+        seconds = sum(piece["duration"] for piece in pieces)
+        new_seconds = sum(piece["duration"] for piece in pieces if not piece["cached"])
+        new_count = sum(1 for piece in pieces if not piece["cached"])
+        made = bool(pieces) and all(piece["cached"] for piece in pieces)
+        # A clip file from an older prompt or length can still be watched,
+        # but generating the video would make it again.
+        old = not made and bool(pieces) and all(Path(piece["path"]).is_file() for piece in pieces)
+        if not pieces:
+            state = "no-still"
+        elif made:
+            state = "made"
+        elif old:
+            state = "stale"
+        else:
+            state = "missing"
+        rows.append({
+            "id": shot["id"],
+            "start": shot["start"],
+            "end": shot["end"],
+            "seconds": seconds,
+            "state": state,
+            "urls": [clip_url(project_id, shot["id"], piece) for piece in pieces] if (made or old) else [],
+            "cost": video_cost(new_seconds, new_count),
+            "redo_cost": video_cost(seconds, len(pieces)),
+        })
+    return rows
+
+
+@app.post("/api/project/{project_id}/clips/status")
+async def clips_status(project_id: str, body: dict = Body(...)):
+    # Board only. One row per shot, in time order, for the Frames reel.
+    _folder, _song, plan = await prepare_video(project_id, body, partial=True)
+    rows = clip_rows(project_id, plan)
+    missing = [row for row in rows if row["state"] in {"missing", "stale"}]
+    return {
+        "song_seconds": plan["song_seconds"],
+        "clips": rows,
+        "missing": len(missing),
+        "missing_cost": round(sum(row["cost"] for row in missing) + 1e-9, 2),
+        "rate": VIDEO_RATE,
+    }
+
+
+async def run_clips(project_id: str, plan: dict, ids: set) -> None:
+    global _video_job
+    targets = [shot for shot in plan["shots"] if shot["id"] in ids]
+    work = [(shot, position, piece) for shot in targets for position, piece in enumerate(shot["pieces"])]
+    todo = [item for item in work if not item[2]["cached"]]
+    total = len(todo)
+    done = 0
+    try:
+        key = api_key()
+        if todo and not key:
+            raise HTTPException(400, "No API key is available on this machine.")
+        timeout = httpx.Timeout(30.0, read=180.0, write=180.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for shot, position, piece in todo:
+                image = shot["image"]
+                if position > 0:
+                    before = shot["pieces"][position - 1]["path"]
+                    image = await last_frame(before, before.with_name(before.stem + "_end.jpg"))
+                await render_clip(client, key, shot, piece, project_id, done, total, image)
+                done += 1
+                video_step(project_id, f"Clip {done} of {total} ready.", done)
+        ticks = 0
+        for _shot, _position, piece in todo:
+            if isinstance(piece.get("ticks"), int):
+                ticks += piece["ticks"]
+        noun = "Clip" if len(targets) == 1 else "Clips"
+        step = f"{noun} ready. Charged ${ticks / 10_000_000_000:.2f}." if ticks else f"{noun} ready."
+        if _video_job and _video_job.get("project_id") == project_id:
+            _video_job["status"] = "done"
+            _video_job["step"] = step
+            _video_job["error"] = ""
+            _video_job["done"] = total
+        print(f"clips {project_id} ready ({total} new)", flush=True)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else "Clip failed."
+        video_fail(project_id, detail)
+        print(f"clips {project_id} failed", flush=True)
+    except httpx.HTTPError:
+        video_fail(project_id, "The video service did not answer.")
+        print(f"clips {project_id} failed", flush=True)
+    except Exception as exc:
+        video_fail(project_id, public_message(str(exc), "Clip failed."))
+        print(f"clips {project_id} failed: {type(exc).__name__}", flush=True)
+
+
+@app.post("/api/project/{project_id}/clips/make")
+async def make_clips(project_id: str, body: dict = Body(...)):
+    # Board only. Makes clips without assembling the video. "ids" picks the
+    # shots (all shots when absent). "redo" makes them again even when the
+    # current take is still valid. "cost" must match what the board showed.
+    global _video_job, _video_task
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        raise HTTPException(400, "Confirm the cost before generating.")
+    if _video_job and _video_job.get("status") == "running":
+        raise HTTPException(409, "A video or clip is already generating.")
+    _folder, _song, plan = await prepare_video(project_id, body, partial=True)
+    wanted = body.get("ids")
+    if isinstance(wanted, list) and wanted:
+        ids = {str(item) for item in wanted}
+    else:
+        ids = {shot["id"] for shot in plan["shots"]}
+    targets = [shot for shot in plan["shots"] if shot["id"] in ids and shot["pieces"]]
+    if not targets:
+        raise HTTPException(400, "Give that shot a still first.")
+    if body.get("redo") is True:
+        for shot in targets:
+            for piece in shot["pieces"]:
+                piece["cached"] = False
+    seconds = sum(piece["duration"] for shot in targets for piece in shot["pieces"] if not piece["cached"])
+    count = sum(1 for shot in targets for piece in shot["pieces"] if not piece["cached"])
+    cost = video_cost(seconds, count)
+    try:
+        shown = round(float(body.get("cost")), 2)
+    except (TypeError, ValueError):
+        shown = -1
+    if abs(shown - cost) > 0.001:
+        raise HTTPException(409, "The estimate changed. Check the cost again.")
+    if seconds == 0:
+        return {"status": "done", "step": "Those clips are already made.", "cost": 0}
+    if not api_key():
+        raise HTTPException(400, "No API key is available on this machine.")
+    total = sum(1 for shot in targets for piece in shot["pieces"] if not piece["cached"])
+    _video_job = {
+        "project_id": project_id,
+        "kind": "clips",
+        "ids": sorted(ids),
+        "status": "running",
+        "step": "Starting the clip." if total == 1 else "Starting the clips.",
+        "done": 0,
+        "total": total,
+        "cost": cost,
+        "url": "",
+        "error": "",
+    }
+    _video_task = asyncio.create_task(run_clips(project_id, plan, {shot["id"] for shot in targets}))
+    return {"status": "running", "step": _video_job["step"], "cost": cost}
 
 
 @app.post("/api/project/{project_id}/video/estimate")
@@ -1718,6 +2664,7 @@ async def start_video(project_id: str, body: dict = Body(...)):
         raise HTTPException(400, "No API key is available on this machine.")
     _video_job = {
         "project_id": project_id,
+        "kind": "video",
         "status": "running",
         "step": "Starting the video.",
         "done": 0,
@@ -1736,6 +2683,8 @@ async def video_status(project_id: str):
     if _video_job and _video_job.get("project_id") == project_id:
         return {
             "status": _video_job.get("status") or "idle",
+            "kind": _video_job.get("kind") or "video",
+            "ids": _video_job.get("ids") or [],
             "step": _video_job.get("step") or "",
             "done": _video_job.get("done") or 0,
             "total": _video_job.get("total") or 0,
