@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
@@ -39,6 +40,7 @@ KEY_FILE = Path.home() / "Documents" / "API" / "grok-video-pipeline.txt"
 PROJECT_RE = re.compile(r"^[a-f0-9]{8}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.'-]{0,59}$")
 SECTION_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+CARD_ROLES = {"cover", "credit", "fill"}
 STILL_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}\.(jpg|jpeg|png|webp)$")
 MAX_SONG = 80 * 1024 * 1024
 MAX_STILL = 20 * 1024 * 1024
@@ -424,9 +426,30 @@ async def attach_song(project_id: str, file: UploadFile = File(...)):
     return {"project_id": project_id, "song": song_name}
 
 
+async def probed_song_seconds(folder: Path, timeline: dict) -> float:
+    """ffprobe length for the open board. Never written into timeline.json."""
+    raw = str(timeline.get("song_path") or "")
+    if not raw:
+        return 0.0
+    path = Path(raw)
+    if not path.is_file():
+        return 0.0
+    try:
+        path.resolve().relative_to(folder.resolve())
+    except ValueError:
+        return 0.0
+    try:
+        return round(float(await media_duration(path)), 1)
+    except HTTPException:
+        return 0.0
+
+
 @app.get("/api/project/{project_id}")
 async def get_project(project_id: str):
-    return read_timeline(project_folder(project_id))
+    folder = project_folder(project_id)
+    timeline = dict(read_timeline(folder))
+    timeline["duration"] = await probed_song_seconds(folder, timeline)
+    return timeline
 
 
 @app.post("/api/project/{project_id}/timeline")
@@ -436,8 +459,27 @@ async def save_timeline(project_id: str, timeline: dict = Body(...)):
     timeline["id"] = project_id
     timeline["song"] = current.get("song")
     timeline["song_path"] = current.get("song_path")
+    timeline.pop("duration", None)
     if not isinstance(timeline.get("sections"), list):
         timeline["sections"] = []
+    previous_roles = {}
+    for item in current.get("sections") or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        if role in CARD_ROLES and item.get("id"):
+            previous_roles[str(item.get("id"))] = role
+    for item in timeline["sections"]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        if role in CARD_ROLES:
+            item["role"] = role
+            continue
+        item.pop("role", None)
+        kept = previous_roles.get(str(item.get("id") or ""))
+        if kept:
+            item["role"] = kept
     timeline["characters"] = clean_characters(timeline.get("characters"))
     if (folder / "video.mp4").is_file():
         timeline["video"] = f"/api/project/{project_id}/video"
@@ -580,6 +622,9 @@ async def generate_image(project_id: str, section_id: str, body: dict = Body(...
             section["start"] = float(body.get("start") or 0)
         if "end" in body:
             section["end"] = float(body.get("end") or 0)
+        role = str(body.get("role") or "").strip()
+        if role in CARD_ROLES:
+            section["role"] = role
         prompt = compose_prompt(timeline, section)
         if len(prompt.strip()) < 8:
             raise HTTPException(400, "Write a prompt or drop lyrics onto this shot first.")
@@ -767,6 +812,107 @@ _VOCAL_HINT = re.compile(
 _INSTRUMENTAL_HINT = re.compile(r"\b(no\s+vocals?|instrumentals?)\b", re.I)
 
 
+# ACE-Step accepts about 10–600 seconds. A preset is only for a forced length.
+ACE_MIN_SECONDS = 10.0
+ACE_MAX_SECONDS = 600.0
+# Turbo with the LM off does not pack a line into a couple of seconds. A 44
+# second track of a 20-line sheet only sang three lines, so each sung line
+# gets its own phrase. A [Verse] or [Chorus] tag is a break, not a lyric.
+# Intro and outro keep the first and last lines from being the ones cut off.
+LYRIC_LINE_SECONDS = 15.0
+LYRIC_SECTION_SECONDS = 4.0
+LYRIC_EDGE_SECONDS = 8.0
+_SECTION_LINE = re.compile(r"\[[^\]\n]{1,48}\]")
+
+
+def length_label(seconds: int) -> str:
+    minutes, rest = divmod(int(seconds), 60)
+    return f"{minutes}:{rest:02d}"
+
+
+def lyric_seconds(lyrics: str) -> float | None:
+    """Seconds the sheet needs so every line can be sung.
+
+    None when the sheet is blank. The result is not snapped to 15, 30, 60,
+    or any other preset.
+    """
+    text = lyrics.strip()
+    if not text:
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()] or [text]
+    sung = 0
+    sections = 0
+    for line in lines:
+        if _SECTION_LINE.fullmatch(line):
+            sections += 1
+        else:
+            sung += 1
+    if sung == 0:
+        sung = len(lines)
+        sections = 0
+    words = re.findall(r"[A-Za-z0-9']+", text)
+    by_lines = sung * LYRIC_LINE_SECONDS + sections * LYRIC_SECTION_SECONDS + LYRIC_EDGE_SECONDS * 2
+    # A long line still needs about a second per word.
+    return max(by_lines, len(words) * 1.0, 8.0)
+
+
+def read_duration(body: dict) -> tuple[str, int]:
+    """('omit', 0), ('fit', -1), or ('preset', seconds)."""
+    if "duration" in body:
+        raw = body.get("duration")
+    elif "audio_duration" in body:
+        raw = body.get("audio_duration")
+    else:
+        return "omit", 0
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "omit", 0
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Length must be 15 seconds to 5 minutes, or full song.")
+    if value <= 0:
+        return "fit", -1
+    if value not in GEN_LENGTHS:
+        raise HTTPException(400, "Length must be 15 seconds to 5 minutes, or full song.")
+    return "preset", value
+
+
+def full_song_duration(lyrics: str) -> float:
+    """Seconds to ask ACE-Step for so every lyric line has time.
+
+    Duration <= 0 is the model's auto length. With the 5Hz LM left off, this
+    ACE-Step build turns that into a fixed 120 second track. The estimate is
+    clamped to 10–600 seconds and is not rounded onto a preset.
+    """
+    seconds = lyric_seconds(lyrics)
+    if seconds is None:
+        raise HTTPException(400, "Pick a length for an instrumental track.")
+    if seconds > ACE_MAX_SECONDS:
+        raise HTTPException(
+            400,
+            "These lyrics look longer than 10:00, which is as long as a generated track can be. Shorten them, then generate.",
+        )
+    return round(min(ACE_MAX_SECONDS, max(ACE_MIN_SECONDS, seconds)), 1)
+
+
+def lyric_fit_check(lyrics: str, preset: int) -> None:
+    """Warn when a forced preset is clearly shorter than the sheet."""
+    seconds = lyric_seconds(lyrics)
+    if seconds is None:
+        return
+    if seconds > ACE_MAX_SECONDS:
+        raise HTTPException(
+            400,
+            "These lyrics look longer than 10:00, which is as long as a generated track can be. Shorten them, then generate.",
+        )
+    if seconds > float(preset) + 4:
+        raise HTTPException(409, {
+            "message": f"These lyrics won't fit in {length_label(preset)}. Fit the song to the lyrics?",
+            "needed": -1,
+            "duration": preset,
+        })
+
+
 def ace_caption(style: str, lyrics: str) -> tuple[str, bool]:
     """Blank lyrics stay instrumental. Any other lyrics are sung."""
     caption = " ".join(style.split())
@@ -792,24 +938,29 @@ async def generate_audio(body: dict = Body(...)):
     style = str(body.get("prompt") or body.get("style") or "").strip()
     if len(style) < 2:
         raise HTTPException(400, "Write a style or mood first.")
-    try:
-        duration = int(body.get("duration") or body.get("audio_duration") or 30)
-    except (TypeError, ValueError):
-        duration = 0
-    if duration not in GEN_LENGTHS:
-        raise HTTPException(400, "Length must be 15 seconds to 5 minutes.")
     lyrics = str(body.get("lyrics") or "").strip()[:12000]
     # The lyric box is what the singer uses. The mood field is left as typed.
     caption, instrumental = ace_caption(style, lyrics)
     if _audio_job:
         raise HTTPException(409, "Audio is already generating.")
+    mode, preset = read_duration(body)
+    if mode == "omit":
+        mode = "fit" if lyrics else "preset"
+        preset = 30
+    # A forced preset that cannot hold the sheet asks before ACE-Step runs.
+    # Agreeing sends full-song mode (duration -1), which is sized from the words.
+    if mode == "fit":
+        audio_duration = full_song_duration(lyrics)
+    else:
+        lyric_fit_check(lyrics, preset)
+        audio_duration = preset
     _audio_job = True
     try:
         request = {
             "prompt": caption,
             "lyrics": "" if instrumental else lyrics,
             "instrumental": instrumental,
-            "audio_duration": duration,
+            "audio_duration": audio_duration,
             "audio_format": "mp3",
             "batch_size": 1,
             "inference_steps": 8,
@@ -826,7 +977,7 @@ async def generate_audio(body: dict = Body(...)):
             task_id = str(data.get("task_id") or "").strip()
             if not task_id:
                 raise HTTPException(502, "ACE-Step did not start a task.")
-            deadline = time.monotonic() + max(480, duration * 8)
+            deadline = time.monotonic() + max(480, int(audio_duration) * 8)
             file_ref = ""
             while True:
                 if time.monotonic() > deadline:
@@ -878,11 +1029,15 @@ async def generate_audio(body: dict = Body(...)):
         name = "g" + uuid.uuid4().hex[:8] + "." + kind
         dest = GENERATED_DIR / name
         dest.write_bytes(download.content)
+        try:
+            heard = await media_duration(dest)
+        except HTTPException:
+            heard = float(audio_duration)
         return {
             "url": "/api/generated/" + name,
             "name": name,
             "path": str(dest),
-            "duration": duration,
+            "duration": round(float(heard), 1),
             "lyrics": lyrics,
             "status": "Track ready. Play it, or use it as the song.",
         }
@@ -898,6 +1053,65 @@ async def generated_audio(filename: str):
     if not path.is_file():
         raise HTTPException(404, "Audio not found")
     return FileResponse(path)
+
+
+CLIP_NAME_RE = re.compile(r"^([A-Za-z0-9_-]{1,40})_(\d+)\.mp4$")
+
+
+@app.get("/api/project/{project_id}/clips")
+async def list_motion_clips(project_id: str):
+    # Flutter client only. The web board does not call this.
+    # Names and relative URLs of cached motion clips, never file contents.
+    folder = project_folder(project_id)
+    clips_dir = (folder / "clips").resolve()
+    items = []
+    names = []
+    if clips_dir.is_dir():
+        try:
+            names = sorted(path.name for path in clips_dir.iterdir() if path.is_file())
+        except OSError:
+            names = []
+    for name in names:
+        match = CLIP_NAME_RE.fullmatch(name)
+        if not match:
+            continue
+        path = (clips_dir / name).resolve()
+        try:
+            path.relative_to(clips_dir)
+        except ValueError:
+            continue
+        if not path.is_file() or path.stat().st_size < 1000:
+            continue
+        section_id = match.group(1)
+        index = int(match.group(2))
+        items.append({
+            "section_id": section_id,
+            "index": index,
+            "url": f"/api/project/{quote(project_id, safe='')}/clips/{section_id}/{index}",
+        })
+    return {"clips": items}
+
+
+@app.get("/api/project/{project_id}/clips/{section_id}/{index}")
+async def motion_clip(project_id: str, section_id: str, index: int):
+    # Flutter client only. The web board does not call this.
+    if not SECTION_RE.fullmatch(section_id or "") or index < 0 or index > 80:
+        raise HTTPException(404, "Clip not found")
+    folder = project_folder(project_id)
+    clips_dir = (folder / "clips").resolve()
+    path = (clips_dir / f"{section_id}_{index}.mp4").resolve()
+    try:
+        path.relative_to(clips_dir)
+    except ValueError:
+        raise HTTPException(404, "Clip not found")
+    if not path.is_file() or path.stat().st_size < 1000:
+        raise HTTPException(404, "Clip not found")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=path.name,
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.post("/api/suggest-lyrics")
@@ -1562,18 +1776,20 @@ if __name__ == "__main__":
 
     # Python opens IPv6 sockets as IPv6-only, so one "::" bind drops IPv4.
     # Listen on both families. Localhost stays on the IPv4 socket.
-    def listener(family: int, host: str) -> socket.socket:
+    # 18080 is the same app. Phone networks often answer cleartext :8080
+    # with HTTP 408 before the request arrives here. The web board stays on 8080.
+    def listener(family: int, host: str, port: int) -> socket.socket:
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if family == socket.AF_INET6:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-        sock.bind((host, 8080))
+        sock.bind((host, port))
         sock.listen(2048)
         return sock
 
-    sockets = [
-        listener(socket.AF_INET, "0.0.0.0"),
-        listener(socket.AF_INET6, "::"),
-    ]
+    sockets = []
+    for port in (8080, 18080):
+        sockets.append(listener(socket.AF_INET, "0.0.0.0", port))
+        sockets.append(listener(socket.AF_INET6, "::", port))
     server = uvicorn.Server(uvicorn.Config(app))
     server.run(sockets=sockets)

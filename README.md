@@ -22,7 +22,7 @@ Original audio is optional. The board still works if that model is down. ACE-Ste
 
 ## Android client
 
-This branch adds a landscape Flutter client in `flutter/`. The phone does not run models. The desktop still runs `python main.py` and does the generation.
+This branch adds a Flutter phone client in `flutter/`. The screen is six full-width tabs: Generate audio, Transcribe audio, Master, Stills, Clips, and Render Video. Portrait and landscape both use those tabs. The phone does not run models. The desktop still runs `python main.py` and does the generation.
 
 ```bash
 cd flutter
@@ -30,7 +30,7 @@ flutter pub get
 flutter run
 ```
 
-The app calls the desktop board at `http://100.67.76.16:8080`. That address is compiled in, and the screen has no server field. Cleartext HTTP is allowed so the phone can reach it.
+The app calls the desktop board at `http://100.67.76.16:8080`, direct, with no HTTP proxy. That address is compiled in, and the screen has no server field. If that port answers HTTP 408, the app retries `http://100.67.76.16:18080`, which is the same board. Cleartext HTTP is allowed.
 
 Create or open a named project before generating. Those folders are the server's OmniVideo/Projects directory. The existing phone file app can browse them when this branch's server is started with:
 

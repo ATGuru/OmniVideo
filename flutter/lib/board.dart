@@ -24,6 +24,7 @@ class Shot {
     this.image = '',
     this.sent = '',
     this.source = '',
+    this.role = '',
   });
 
   final String id;
@@ -34,19 +35,24 @@ class Shot {
   String image;
   String sent;
   String source;
+  String role;
   bool suggesting = false;
   bool promptEdited = false;
 
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'start': start,
-        'end': end,
-        'lyrics': lyrics,
-        'prompt': prompt,
-        'image': image.split('?').first,
-        'sent': sent,
-        'source': source,
-      };
+  Map<String, dynamic> toJson() {
+    final row = <String, dynamic>{
+      'id': id,
+      'start': start,
+      'end': end,
+      'lyrics': lyrics,
+      'prompt': prompt,
+      'image': image.split('?').first,
+      'sent': sent,
+      'source': source,
+    };
+    if (role == 'cover' || role == 'credit' || role == 'fill') row['role'] = role;
+    return row;
+  }
 }
 
 class UploadStill {
@@ -75,14 +81,25 @@ class VideoQuote {
   String get label => cost > 0 ? 'Generate for \$${cost.toStringAsFixed(2)}' : 'Assemble video';
 }
 
-/// Board state for the landscape client. Generation stays on the desktop API.
+class MotionClip {
+  const MotionClip({required this.sectionId, required this.index, required this.url});
+
+  final String sectionId;
+  final int index;
+  final String url;
+}
+
+/// Board state for the phone client. Generation stays on the desktop API.
 class BoardController extends ChangeNotifier {
   BoardController({OmniApi? api}) : api = api ?? OmniApi(kOmniVideoBackend);
 
   OmniApi api;
 
+  /// Asks whether to drop the preset and fit the track to the lyrics.
+  Future<bool> Function(String message)? askToExtend;
+
   String status = '';
-  String tab = 'transcribe';
+  String tab = 'generate';
   int epoch = 0;
 
   String projectId = '';
@@ -106,6 +123,12 @@ class BoardController extends ChangeNotifier {
   String style = '';
   String draftLyrics = '';
   int length = 30;
+
+  /// When true, generate sends duration -1 and ignores [length].
+  bool fitLyrics = false;
+
+  /// The user turned full-song off, or picked a preset, while lyrics are present.
+  bool _fitPinnedOff = false;
   GeneratedTrack? generated;
 
   String videoUrl = '';
@@ -113,6 +136,7 @@ class BoardController extends ChangeNotifier {
   VideoQuote? quote;
   bool videoRunning = false;
   String videoNote = '';
+  List<MotionClip> motionClips = [];
 
   bool busy = false;
   bool audioJob = false;
@@ -146,7 +170,10 @@ class BoardController extends ChangeNotifier {
   String get videoSrc => videoUrl.isEmpty ? '' : '$videoUrl?t=$videoStamp';
 
   bool lineIsUsed(LyricLine line) {
-    return lineUsed(line, [for (final shot in sections) TimeSpan(shot.start, shot.end)]);
+    return lineUsed(line, [
+      for (final shot in sections)
+        if (shot.role != 'cover' && shot.role != 'credit' && shot.role != 'fill') TimeSpan(shot.start, shot.end),
+    ]);
   }
 
   bool shotOverlaps(Shot shot) {
@@ -175,6 +202,38 @@ class BoardController extends ChangeNotifier {
   void showTab(String name) {
     tab = name;
     _notify();
+    if (name == 'clips' && hasProject) unawaited(refreshClips());
+  }
+
+  Future<void> refreshClips() async {
+    if (!hasProject || _disposed) {
+      motionClips = [];
+      return;
+    }
+    try {
+      final data = await api.get(OmniApi.projectPath(projectId, '/clips'), timeout: OmniApi.settingsTimeout);
+      if (_disposed) return;
+      final rows = data['clips'];
+      motionClips = [
+        if (rows is List)
+          for (final row in rows)
+            if (row is Map && '${row['section_id'] ?? ''}'.isNotEmpty && '${row['url'] ?? ''}'.isNotEmpty)
+              MotionClip(
+                sectionId: '${row['section_id']}',
+                index: int.tryParse('${row['index']}') ?? 0,
+                url: '${row['url']}',
+              ),
+      ];
+      _notify();
+    } on OmniException catch (err) {
+      motionClips = [];
+      if (_disposed) return;
+      if (err.statusCode == 404) {
+        _notify();
+        return;
+      }
+      setStatus(err.message);
+    }
   }
 
   Future<void> refreshProjects() async {
@@ -243,6 +302,7 @@ class BoardController extends ChangeNotifier {
               image: '${row['image'] ?? ''}'.split('?').first,
               sent: '${row['sent'] ?? ''}',
               source: '${row['source'] ?? ''}',
+              role: _clipRole(row['role']),
             ),
     ];
     final tray = timeline['uploads'];
@@ -513,6 +573,7 @@ class BoardController extends ChangeNotifier {
     shot.suggesting = true;
     sections = [...sections, shot]..sort((a, b) => a.start != b.start ? a.start.compareTo(b.start) : a.end.compareTo(b.end));
     final when = '${formatTime(shot.start)} – ${formatTime(shot.end)}';
+    tab = 'clips';
     status = clipped
         ? 'Placed at $when, where the timeline had room. Suggesting a prompt.'
         : 'Placed at $when. Suggesting a prompt.';
@@ -580,12 +641,34 @@ class BoardController extends ChangeNotifier {
   }
 
   void setDraftLyrics(String value) {
+    _applyDraftLyrics(value);
+    _notify();
+  }
+
+  void _applyDraftLyrics(String value) {
     draftLyrics = value;
+    final has = value.trim().isNotEmpty;
+    if (!has) {
+      fitLyrics = false;
+      _fitPinnedOff = false;
+    } else if (!_fitPinnedOff) {
+      fitLyrics = true;
+    }
+  }
+
+  void setFitLyrics(bool value) {
+    final has = draftLyrics.trim().isNotEmpty;
+    fitLyrics = value && has;
+    _fitPinnedOff = has && !fitLyrics;
     _notify();
   }
 
   void setLength(int value) {
     length = value;
+    if (draftLyrics.trim().isNotEmpty) {
+      fitLyrics = false;
+      _fitPinnedOff = true;
+    }
     _notify();
   }
 
@@ -617,7 +700,7 @@ class BoardController extends ChangeNotifier {
     setStatus('Suggesting lyrics…');
     try {
       final data = await api.postJson('/api/suggest-lyrics', {'prompt': style.trim()});
-      draftLyrics = '${data['lyrics'] ?? ''}';
+      _applyDraftLyrics('${data['lyrics'] ?? ''}');
       epoch += 1;
       setStatus('Lyrics suggested. Edit them, then generate.');
     } on OmniException catch (err) {
@@ -631,22 +714,37 @@ class BoardController extends ChangeNotifier {
       setStatus('Write a style or mood first.');
       return;
     }
+    final lyrics = draftLyrics.trim();
+    final fit = fitLyrics && lyrics.isNotEmpty;
     audioJob = true;
     setStatus('Generating audio on the desktop. This can take a few minutes.');
     try {
       final data = await api.postJson(
         '/api/generate-audio',
-        {'prompt': style.trim(), 'lyrics': draftLyrics.trim(), 'duration': length},
+        {'prompt': style.trim(), 'lyrics': lyrics, 'duration': fit ? -1 : length},
         timeout: OmniApi.audioTimeout,
       );
+      final reported = _asDouble(data['duration'], fallback: fit ? 0 : length.toDouble());
       generated = GeneratedTrack(
         url: '${data['url'] ?? ''}',
         name: '${data['name'] ?? 'generated.mp3'}',
-        lyrics: data['lyrics'] is String ? data['lyrics'] as String : draftLyrics.trim(),
-        duration: _asDouble(data['duration'], fallback: length.toDouble()),
+        lyrics: data['lyrics'] is String ? data['lyrics'] as String : lyrics,
+        duration: reported > 0 ? reported : (fit ? 0 : length.toDouble()),
       );
       setStatus('${data['status'] ?? 'Track ready. Play it, or use it as the song.'}');
     } on OmniException catch (err) {
+      if (err.statusCode == 409 && err.needed == -1) {
+        audioJob = false;
+        _notify();
+        final extend = askToExtend == null ? false : await askToExtend!(err.message);
+        if (!extend) {
+          setStatus(err.message);
+          return;
+        }
+        setFitLyrics(true);
+        await generateAudio();
+        return;
+      }
       setStatus(err.message);
     } finally {
       audioJob = false;
@@ -684,7 +782,7 @@ class BoardController extends ChangeNotifier {
       epoch += 1;
       setStatus(lines.isEmpty
           ? 'Track loaded. No lyrics were written for it.'
-          : 'Track loaded. The lyrics you wrote are on the left.');
+          : 'Track loaded. The lyrics you wrote are on Transcribe.');
     } on OmniException catch (err) {
       setStatus(err.message);
     }
@@ -872,6 +970,7 @@ class BoardController extends ChangeNotifier {
             'lyrics': shot.lyrics,
             'prompt': shot.prompt,
             'image': shot.image.split('?').first,
+            if (shot.role == 'cover' || shot.role == 'credit' || shot.role == 'fill') 'role': shot.role,
           },
       ],
     };
@@ -991,6 +1090,7 @@ class BoardController extends ChangeNotifier {
         videoStamp = DateTime.now().millisecondsSinceEpoch;
         videoNote = '${data['step'] ?? 'Video ready.'}';
         setStatus(videoNote);
+        unawaited(refreshClips());
         return;
       }
       if (state == 'error') {
@@ -1022,6 +1122,12 @@ class BoardController extends ChangeNotifier {
 double _asDouble(Object? value, {double fallback = 0}) {
   if (value is num) return value.toDouble();
   return double.tryParse('$value') ?? fallback;
+}
+
+String _clipRole(Object? value) {
+  final role = '${value ?? ''}';
+  if (role == 'cover' || role == 'credit' || role == 'fill') return role;
+  return '';
 }
 
 bool _isStillName(String name) {
