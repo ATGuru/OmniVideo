@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OmniVideo</title>
-<link rel="stylesheet" href="/static/style.css?v=14">
+<link rel="stylesheet" href="/static/style.css?v=17">
 </head>
 <body>
 <header>
@@ -83,8 +83,19 @@
     <div class="work-scroll">
       <div class="col-head">
         <h2>Timeline</h2>
+        <div class="header-actions">
+          <button id="add-cover" type="button">Cover</button>
+          <button id="add-credit" type="button">End credit</button>
+        </div>
       </div>
-      <p class="note">Highlight lyrics on the left and drop them here. Each card is one shot: the words, the prompt, and a regenerate.</p>
+      <p class="note">Highlight lyrics on the left and drop them here. Drag a card's edge to change how long it plays. Insert a card in any gap that still holds a still picture. Cover fills the opening. End credit fills the close.</p>
+      <div id="coverage" class="coverage" hidden>
+        <div class="coverage-head">
+          <strong id="coverage-total"></strong>
+          <span id="coverage-hold"></span>
+        </div>
+        <div id="coverage-bar" class="coverage-bar"></div>
+      </div>
       <div id="board" class="board">
         <div id="timeline"></div>
         <p id="drop-hint" class="drop-hint">Drop a lyric selection here</p>
@@ -183,6 +194,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=21"></script>
+<script src="/static/app.js?v=23"></script>
 </body>
 </html>

@@ -23,6 +23,11 @@ let generatedTrack = null;
 let videoUrl = "";
 let videoQuote = null;
 let videoTimer = 0;
+let songSeconds = 0;
+let estimateTimer = 0;
+let estimateToken = 0;
+let persistTimer = 0;
+let clipDrag = false;
 
 const lyricsEl = document.getElementById("lyrics");
 const selectionBar = document.getElementById("selection-bar");
@@ -241,7 +246,7 @@ function commitLyricEdit() {
   document.querySelectorAll(".section-card").forEach((card) => {
     const sec = sections.find((item) => item.id === card.dataset.id);
     const node = card.querySelector(".shot-lyrics");
-    if (sec && node) node.textContent = sec.lyrics;
+    if (sec && node) node.textContent = shotWords(sec);
   });
   if (openFrame && openFrame.section) {
     openFrame.lyrics = openFrame.section.lyrics || "";
@@ -264,6 +269,7 @@ function frameFromSection(sec) {
     lyrics: sec.lyrics || "",
     image: sec.image || "",
     sent: sec.sent || "",
+    role: sec.role || "",
     section: sec,
   };
 }
@@ -281,6 +287,7 @@ function overlaps(section) {
 function lineUsed(line) {
   const span = Math.max(0.1, line.end - line.start);
   return sections.some((sec) => {
+    if (plainRole(sec.role)) return false;
     const overlap = Math.min(sec.end, line.end) - Math.max(sec.start, line.start);
     return overlap > span * 0.5;
   });
@@ -296,6 +303,7 @@ function markUsedLines() {
 function alreadyPlaced(payload) {
   const text = String(payload.lyrics || "").trim();
   return sections.some((sec) => {
+    if (plainRole(sec.role)) return false;
     const sameWords = text && String(sec.lyrics || "").trim() === text;
     const covers = sec.start <= Number(payload.start) + 0.05 && sec.end >= Number(payload.end) - 0.05;
     return sameWords && covers;
@@ -321,6 +329,376 @@ function fittingSpan(start, end) {
   return best;
 }
 
+function plainRole(role) {
+  return role === "cover" || role === "credit" || role === "fill";
+}
+
+function cardLabel(sec) {
+  if (!sec) return "";
+  if (sec.role === "cover") return "Cover";
+  if (sec.role === "credit") return "End credit";
+  if (sec.role === "fill") return "Card";
+  return "";
+}
+
+function shotWords(sec) {
+  const words = String((sec && sec.lyrics) || "").trim();
+  if (words) return words;
+  return cardLabel(sec);
+}
+
+function roundTenth(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return NaN;
+  return Math.round((number + Number.EPSILON) * 10) / 10;
+}
+
+function floorTenth(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return NaN;
+  return Math.floor(number * 10 + 1e-4) / 10;
+}
+
+function nextBoundary(sec) {
+  let limit = songSeconds > 0 ? songSeconds : Infinity;
+  sections.forEach((other) => {
+    if (other.id === sec.id) return;
+    if (other.start > sec.start + 0.001 && other.start < limit) limit = other.start;
+  });
+  return limit;
+}
+
+function maxDuration(sec) {
+  const limit = nextBoundary(sec);
+  const current = Math.max(0.2, sec.end - sec.start);
+  if (!Number.isFinite(limit)) return Math.max(current, 30);
+  const room = limit - sec.start;
+  if (room < 0.2) return current;
+  return Math.max(0.2, floorTenth(room));
+}
+
+function clampDuration(sec, seconds) {
+  let value = roundTenth(seconds);
+  if (!Number.isFinite(value)) value = roundTenth(sec.end - sec.start);
+  if (!Number.isFinite(value) || value < 0.2) value = 0.2;
+  const limit = nextBoundary(sec);
+  if (Number.isFinite(limit)) {
+    const max = floorTenth(limit - sec.start);
+    if (max >= 0.2 && value > max) value = max;
+  }
+  return value;
+}
+
+function holdAmount() {
+  if (!(songSeconds > 0)) return null;
+  let songEnd = songSeconds;
+  let covered = 0;
+  sections.forEach((sec) => {
+    covered += Math.max(0, sec.end - sec.start);
+    if (sec.end > songEnd) songEnd = sec.end;
+  });
+  return Math.round((songEnd - covered) * 100) / 100;
+}
+
+function orderedSections() {
+  return [...sections].sort((a, b) => a.start - b.start || a.end - b.end);
+}
+
+function coveredSeconds() {
+  return sections.reduce((sum, sec) => sum + Math.max(0, sec.end - sec.start), 0);
+}
+
+function listGaps() {
+  const gaps = [];
+  let cursor = 0;
+  orderedSections().forEach((sec) => {
+    if (sec.start > cursor + 0.2) gaps.push({ start: cursor, end: sec.start });
+    cursor = Math.max(cursor, sec.end);
+  });
+  if (songSeconds > cursor + 0.2) gaps.push({ start: cursor, end: songSeconds });
+  return gaps;
+}
+
+function gapRow(start, end) {
+  const row = document.createElement("div");
+  row.className = "gap-row";
+  const label = document.createElement("span");
+  const span = Math.max(0, end - start);
+  label.textContent = span.toFixed(1) + "s uncovered · " + formatTime(start) + " – " + formatTime(end);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "Insert card";
+  button.addEventListener("click", () => insertGapCard(start, end, "fill"));
+  row.append(label, button);
+  return row;
+}
+
+function refreshGapRows() {
+  const root = document.getElementById("timeline");
+  if (!root) return;
+  root.querySelectorAll(".gap-row").forEach((el) => el.remove());
+  let cursor = 0;
+  orderedSections().forEach((sec) => {
+    if (sec.start > cursor + 0.2) {
+      const row = gapRow(cursor, sec.start);
+      const card = root.querySelector('.section-card[data-id="' + CSS.escape(sec.id) + '"]');
+      if (card) root.insertBefore(row, card);
+      else root.appendChild(row);
+    }
+    cursor = Math.max(cursor, sec.end);
+  });
+  if (songSeconds > cursor + 0.2) root.appendChild(gapRow(cursor, songSeconds));
+}
+
+function renderCoverage() {
+  const box = document.getElementById("coverage");
+  if (!box) return;
+  const known = songSeconds > 0;
+  if (!known && !sections.length) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const covered = coveredSeconds();
+  const total = document.getElementById("coverage-total");
+  const holdEl = document.getElementById("coverage-hold");
+  if (known) {
+    total.textContent = "Covered " + covered.toFixed(1) + "s of " + songSeconds.toFixed(1) + "s";
+    const hold = holdAmount();
+    holdEl.textContent = hold !== null && hold > 0.25
+      ? "About " + Math.round(hold).toFixed(0) + "s of the song holds the current picture and is not billed."
+      : (sections.length ? "The timeline covers the song. Nothing is left as a still hold." : "");
+  } else {
+    total.textContent = "Covered " + covered.toFixed(1) + "s. The song length isn't known yet.";
+    holdEl.textContent = "";
+  }
+  const bar = document.getElementById("coverage-bar");
+  bar.replaceChildren();
+  const scale = Math.max(known ? songSeconds : 0, ...sections.map((sec) => sec.end), 0);
+  if (scale > 0) {
+    let cursor = 0;
+    const paintGap = (start, end) => {
+      if (end - start <= 0.05) return;
+      const wide = end - start >= 0.2;
+      const piece = document.createElement(wide ? "button" : "div");
+      piece.className = "coverage-piece gap";
+      piece.style.flexGrow = String(end - start);
+      if (wide) {
+        piece.type = "button";
+        piece.title = "Insert a card in " + (end - start).toFixed(1) + "s at " + formatTime(start);
+        piece.addEventListener("click", () => insertGapCard(start, end, "fill"));
+      }
+      bar.appendChild(piece);
+    };
+    const paintCard = (start, end) => {
+      if (end - start <= 0.05) return;
+      const piece = document.createElement("div");
+      piece.className = "coverage-piece covered";
+      piece.style.flexGrow = String(end - start);
+      bar.appendChild(piece);
+    };
+    orderedSections().forEach((sec) => {
+      if (sec.start > cursor + 0.05) paintGap(cursor, sec.start);
+      paintCard(sec.start, sec.end);
+      cursor = Math.max(cursor, sec.end);
+    });
+    if (scale > cursor + 0.05) paintGap(cursor, scale);
+  }
+  refreshGapRows();
+}
+
+function renderHold() {
+  renderCoverage();
+}
+
+function paintWarnings(card, sec) {
+  const head = card.querySelector(".shot-head");
+  const remove = head.querySelector(".text-btn");
+  const span = sec.end - sec.start;
+  let over = head.querySelector(".warn-long");
+  if (span > 15) {
+    if (!over) {
+      over = document.createElement("span");
+      over.className = "warn warn-long";
+      over.textContent = "Over 15s";
+      head.insertBefore(over, remove);
+    }
+  } else if (over) {
+    over.remove();
+  }
+  let overlap = head.querySelector(".warn-over");
+  if (overlaps(sec)) {
+    if (!overlap) {
+      overlap = document.createElement("span");
+      overlap.className = "warn warn-over";
+      overlap.textContent = "Overlaps";
+      head.insertBefore(overlap, remove);
+    }
+  } else if (overlap) {
+    overlap.remove();
+  }
+}
+
+function paintClip(sec, card) {
+  if (!card) card = document.querySelector('.section-card[data-id="' + CSS.escape(sec.id) + '"]');
+  if (!card) return;
+  const span = sec.end - sec.start;
+  const time = card.querySelector(".shot-time");
+  if (time) time.textContent = formatTime(sec.start) + " – " + formatTime(sec.end);
+  const meta = card.querySelector(".shot-meta");
+  if (meta) meta.textContent = span.toFixed(1) + "s";
+  const field = card.querySelector(".clip-duration");
+  if (field) {
+    field.max = String(maxDuration(sec));
+    if (document.activeElement !== field) field.value = span.toFixed(1);
+  }
+  const fill = card.querySelector(".clip-fill");
+  if (fill) {
+    const max = Math.max(0.2, maxDuration(sec));
+    const pct = Math.max(0, Math.min(100, (span / max) * 100));
+    fill.style.width = pct + "%";
+  }
+  paintWarnings(card, sec);
+  if (openFrame && openFrame.id === sec.id) {
+    openFrame.start = sec.start;
+    openFrame.end = sec.end;
+    const label = cardLabel(sec);
+    document.getElementById("frame-title").textContent =
+      (label ? label + " · " : "") + formatTime(sec.start) + " – " + formatTime(sec.end);
+  }
+  const reelTime = document.querySelector(
+    '#reel-scroller .frame[data-id="' + CSS.escape(sec.id) + '"] .frame-time'
+  );
+  if (reelTime) {
+    const label = cardLabel(sec);
+    reelTime.textContent = (label ? label + " · " : "") + formatTime(sec.start) + " – " + formatTime(sec.end);
+  }
+}
+
+function setClipDuration(sec, seconds, live) {
+  let next = clampDuration(sec, seconds);
+  if (!live) next = roundTenth(next);
+  sec.end = Math.round((sec.start + next) * 1000) / 1000;
+  if (sec.end <= sec.start) sec.end = Math.round((sec.start + 0.2) * 1000) / 1000;
+  paintClip(sec);
+  renderHold();
+  if (live) {
+    persistSoon();
+    scheduleEstimate();
+    return;
+  }
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = 0;
+  }
+  sections.sort((a, b) => a.start - b.start || a.end - b.end);
+  renderTimeline();
+  persist();
+  scheduleEstimate();
+}
+
+function bindDuration(sec, card) {
+  const field = card.querySelector(".clip-duration");
+  const handle = card.querySelector(".clip-handle");
+  const track = card.querySelector(".clip-track");
+  field.addEventListener("input", () => {
+    setClipDuration(sec, field.value, true);
+  });
+  field.addEventListener("change", () => {
+    setClipDuration(sec, field.value, false);
+  });
+  field.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+  });
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    clipDrag = true;
+    handle.setPointerCapture(event.pointerId);
+    const move = (ev) => {
+      const rect = track.getBoundingClientRect();
+      const width = rect.width || 1;
+      const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / width));
+      setClipDuration(sec, Math.max(0.2, frac * maxDuration(sec)), true);
+    };
+    const up = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
+      clipDrag = false;
+      setClipDuration(sec, sec.end - sec.start, false);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
+  });
+}
+
+function insertGapCard(start, end, role) {
+  const kind = plainRole(role) ? role : "fill";
+  const name = cardLabel({ role: kind }) || "Card";
+  if ((kind === "cover" || kind === "credit") && sections.some((sec) => sec.role === kind)) {
+    setStatus(name + " is already on the timeline.");
+    return;
+  }
+  if (!(end - start >= 0.2)) {
+    setStatus("That gap is too small for a card.");
+    return;
+  }
+  let id = kind === "fill" ? newId() : kind;
+  if (sections.some((sec) => sec.id === id)) id = newId();
+  const sec = {
+    id,
+    role: kind,
+    start,
+    end,
+    lyrics: "",
+    prompt: "",
+    suggesting: false,
+    promptEdited: false,
+  };
+  sections.push(sec);
+  sections.sort((a, b) => a.start - b.start || a.end - b.end);
+  renderTimeline();
+  persist();
+  scheduleEstimate();
+  const card = document.querySelector('.section-card[data-id="' + CSS.escape(sec.id) + '"]');
+  if (card) {
+    card.classList.add("placed");
+    card.scrollIntoView({ block: "nearest" });
+  }
+  setStatus(name + " placed at " + formatTime(start) + " – " + formatTime(end) + ", filling that gap. Shorten it if you want a shorter shot.");
+}
+
+function placeEdgeCard(role) {
+  const name = cardLabel({ role }) || "Card";
+  if (sections.some((sec) => sec.role === role)) {
+    setStatus(name + " is already on the timeline.");
+    return;
+  }
+  const gaps = listGaps();
+  if (role === "cover") {
+    const opening = gaps.find((gap) => gap.start <= 0.05);
+    if (!opening) {
+      setStatus("The song already starts on a shot.");
+      return;
+    }
+    insertGapCard(opening.start, opening.end, "cover");
+    return;
+  }
+  if (!(songSeconds > 0)) {
+    setStatus("The song length isn't known yet.");
+    return;
+  }
+  const tail = [...gaps].reverse().find((gap) => gap.end >= songSeconds - 0.05);
+  if (!tail) {
+    setStatus("The timeline already reaches the end of the song.");
+    return;
+  }
+  insertGapCard(tail.start, tail.end, "credit");
+}
+
 function renderTimeline() {
   const root = document.getElementById("timeline");
   root.replaceChildren();
@@ -337,6 +715,7 @@ function renderTimeline() {
     const head = document.createElement("div");
     head.className = "shot-head";
     const time = document.createElement("strong");
+    time.className = "shot-time";
     time.textContent = formatTime(sec.start) + " – " + formatTime(sec.end);
     const meta = document.createElement("span");
     meta.className = "shot-meta";
@@ -345,13 +724,13 @@ function renderTimeline() {
     head.append(time, meta);
     if (span > 15) {
       const warn = document.createElement("span");
-      warn.className = "warn";
+      warn.className = "warn warn-long";
       warn.textContent = "Over 15s";
       head.appendChild(warn);
     }
     if (overlaps(sec)) {
       const warn = document.createElement("span");
-      warn.className = "warn";
+      warn.className = "warn warn-over";
       warn.textContent = "Overlaps";
       head.appendChild(warn);
     }
@@ -363,12 +742,40 @@ function renderTimeline() {
       sections = sections.filter((item) => item.id !== sec.id);
       renderTimeline();
       persist();
+      scheduleEstimate();
     });
     head.appendChild(remove);
 
+    const clipRow = document.createElement("div");
+    clipRow.className = "clip-row";
+    const track = document.createElement("div");
+    track.className = "clip-track";
+    const fill = document.createElement("div");
+    fill.className = "clip-fill";
+    const handle = document.createElement("button");
+    handle.type = "button";
+    handle.className = "clip-handle";
+    handle.setAttribute("aria-label", "Drag to change duration");
+    fill.appendChild(handle);
+    track.appendChild(fill);
+    const length = document.createElement("label");
+    length.className = "clip-length";
+    const field = document.createElement("input");
+    field.type = "number";
+    field.className = "clip-duration";
+    field.min = "0.2";
+    field.step = "0.1";
+    field.setAttribute("aria-label", "Duration in seconds");
+    const unit = document.createElement("span");
+    unit.textContent = "s";
+    length.append(field, unit);
+    clipRow.append(track, length);
+
     const lyric = document.createElement("p");
     lyric.className = "shot-lyrics";
-    lyric.textContent = sec.lyrics;
+    const label = cardLabel(sec);
+    if (!String(sec.lyrics || "").trim() && label) lyric.classList.add("card-name");
+    lyric.textContent = shotWords(sec);
 
     const body = document.createElement("div");
     body.className = "shot-body";
@@ -409,7 +816,7 @@ function renderTimeline() {
     prompt.rows = 4;
     prompt.placeholder = sec.suggesting
       ? "Suggesting a prompt from these lyrics…"
-      : "What this shot should show";
+      : (label ? "Optional prompt for this card" : "What this shot should show");
     prompt.value = sec.prompt || "";
     if (sec.suggesting) shotStatus.textContent = "Suggesting a prompt…";
     prompt.addEventListener("input", () => {
@@ -423,11 +830,14 @@ function renderTimeline() {
       persist();
     });
     body.append(side, prompt);
-    card.append(head, lyric, body, shotStatus);
+    card.append(head, clipRow, lyric, body, shotStatus);
+    bindDuration(sec, card);
     root.appendChild(card);
+    paintClip(sec, card);
   });
   markUsedLines();
   renderReel();
+  renderHold();
 }
 
 function isStillFile(file) {
@@ -623,7 +1033,8 @@ function renderReel() {
     poster.appendChild(badge);
     const time = document.createElement("span");
     time.className = "frame-time";
-    time.textContent = formatTime(frame.start) + " – " + formatTime(frame.end);
+    const label = frame.section ? cardLabel(frame.section) : cardLabel(frame);
+    time.textContent = (label ? label + " · " : "") + formatTime(frame.start) + " – " + formatTime(frame.end);
     button.append(poster, time);
     scroller.appendChild(button);
   });
@@ -633,13 +1044,15 @@ function renderReel() {
 function openFrameModal(frame, button) {
   openFrame = frame.section ? frameFromSection(frame.section, sections.indexOf(frame.section)) : frame;
   lastFrameButton = button || null;
+  const frameLabel = cardLabel(openFrame.section || openFrame);
   document.getElementById("frame-title").textContent =
-    formatTime(openFrame.start) + " – " + formatTime(openFrame.end);
+    (frameLabel ? frameLabel + " · " : "") + formatTime(openFrame.start) + " – " + formatTime(openFrame.end);
   const kind = openFrame.kind === "clip" ? "Clip" : "Still";
   const yours = openFrame.section && openFrame.section.source === "upload";
+  const lead = frameLabel ? frameLabel + ". " : "";
   document.getElementById("frame-meta").textContent = yours
-    ? kind + " · your still. Regenerate replaces it at $0.02."
-    : kind + (openFrame.image ? "" : " · empty. Drop a still here, or generate.");
+    ? lead + kind + " · your still. Regenerate replaces it at $0.02."
+    : lead + kind + (openFrame.image ? "" : " · empty. Drop a still here, or generate.");
   document.getElementById("frame-lyrics").textContent = openFrame.lyrics || "";
   const stage = document.getElementById("frame-stage");
   stage.replaceChildren();
@@ -859,6 +1272,7 @@ async function loadSong(file, written) {
   const timeline = await (await fetch(projectApi(currentProject))).json();
   songPath = timeline.song_path || "";
   songName = timeline.song || file.name;
+  songSeconds = Number(timeline.duration) > 0 ? Number(timeline.duration) : 0;
   document.getElementById("song-label").textContent = songName;
   showTitle();
   lyricsEdited = false;
@@ -872,6 +1286,7 @@ async function loadSong(file, written) {
   }
   renderLyrics();
   syncLyricsChrome();
+  renderTimeline();
   persist();
   setStatus(written
     ? (lines.length
@@ -887,6 +1302,7 @@ function boardState() {
     projectName,
     songName,
     songPath,
+    songSeconds,
     feel: feelEl.value,
     master: masterEl.value,
     cast,
@@ -910,6 +1326,35 @@ function persist() {
   sessionStorage.setItem("omnivid-board", JSON.stringify(boardState()));
 }
 
+function persistSoon() {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistTimer = 0;
+    persist();
+  }, 200);
+}
+
+async function refreshSongLength() {
+  if (!currentProject) return;
+  try {
+    const res = await fetch(projectApi(currentProject));
+    if (!res.ok) return;
+    const data = await res.json();
+    if (typeof data.duration !== "number") return;
+    const probed = data.duration > 0 ? data.duration : 0;
+    if (probed === songSeconds) {
+      renderHold();
+      return;
+    }
+    songSeconds = probed;
+    if (!clipDrag) renderTimeline();
+    else renderHold();
+    persist();
+  } catch {
+    renderHold();
+  }
+}
+
 function restore() {
   const raw = sessionStorage.getItem("omnivid-board");
   if (!raw) return;
@@ -919,6 +1364,7 @@ function restore() {
     projectName = data.projectName || "";
     songName = data.songName || "";
     songPath = data.songPath || "";
+    songSeconds = Number(data.songSeconds) > 0 ? Number(data.songSeconds) : 0;
     if (songName) document.getElementById("song-label").textContent = songName;
     showTitle();
     feelEl.value = data.feel || "";
@@ -1144,6 +1590,7 @@ async function generateOne(sec) {
         lyrics: sec.lyrics || "",
         start: sec.start,
         end: sec.end,
+        role: plainRole(sec.role) ? sec.role : "",
         feel: feelEl.value,
         master_prompt: masterEl.value,
         characters: cast.filter((person) => person.name || person.look),
@@ -1271,6 +1718,7 @@ function resetBoard(name, id) {
   currentProject = id;
   songName = "";
   songPath = "";
+  songSeconds = 0;
   lines = [];
   lyricsSource = "";
   lyricsEdited = false;
@@ -1378,16 +1826,20 @@ document.getElementById("save-btn").addEventListener("click", async () => {
     characters: cast.filter((person) => person.name || person.look),
     lyrics_source: lyricsSource,
     lyrics: lines.map((line) => ({ start: line.start, end: line.end, text: line.text })),
-    sections: sections.map((sec) => ({
-      id: sec.id,
-      start: sec.start,
-      end: sec.end,
-      lyrics: sec.lyrics,
-      prompt: sec.prompt || "",
-      image: sec.image ? String(sec.image).split("?")[0] : "",
-      sent: sec.sent || "",
-      source: sec.source || "",
-    })),
+    sections: sections.map((sec) => {
+      const row = {
+        id: sec.id,
+        start: sec.start,
+        end: sec.end,
+        lyrics: sec.lyrics,
+        prompt: sec.prompt || "",
+        image: sec.image ? String(sec.image).split("?")[0] : "",
+        sent: sec.sent || "",
+        source: sec.source || "",
+      };
+      if (plainRole(sec.role)) row.role = sec.role;
+      return row;
+    }),
     video: videoUrl,
     uploads: uploads.map((item) => ({
       id: item.id,
@@ -1742,20 +2194,61 @@ function videoBody() {
     feel: feelEl.value,
     master_prompt: masterEl.value,
     characters: cast.filter((person) => person.name || person.look),
-    sections: sections.map((sec) => ({
-      id: sec.id,
-      start: sec.start,
-      end: sec.end,
-      lyrics: sec.lyrics || "",
-      prompt: sec.prompt || "",
-      image: sec.image ? String(sec.image).split("?")[0] : "",
-    })),
+    sections: sections.map((sec) => {
+      const row = {
+        id: sec.id,
+        start: sec.start,
+        end: sec.end,
+        lyrics: sec.lyrics || "",
+        prompt: sec.prompt || "",
+        image: sec.image ? String(sec.image).split("?")[0] : "",
+      };
+      if (plainRole(sec.role)) row.role = sec.role;
+      return row;
+    }),
   };
 }
 
 function hideVideoQuote() {
   videoQuote = null;
   document.getElementById("video-confirm").hidden = true;
+}
+
+function scheduleEstimate() {
+  const panel = document.getElementById("video-confirm");
+  if (!panel || panel.hidden || busy || !currentProject) return;
+  if (estimateTimer) clearTimeout(estimateTimer);
+  estimateTimer = setTimeout(() => {
+    estimateTimer = 0;
+    refreshEstimate();
+  }, 300);
+}
+
+async function refreshEstimate() {
+  if (!currentProject || document.getElementById("video-confirm").hidden || busy) return;
+  const token = ++estimateToken;
+  try {
+    const res = await fetch(projectApi(currentProject, "/video/estimate"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(videoBody()),
+    });
+    if (token !== estimateToken || document.getElementById("video-confirm").hidden) return;
+    if (!res.ok) throw new Error(await readError(res));
+    const data = await res.json();
+    if (!(songSeconds > 0) && Number(data.song_seconds) > 0) songSeconds = Number(data.song_seconds);
+    videoQuote = data;
+    document.getElementById("video-estimate").textContent = data.note || "";
+    document.getElementById("video-go").textContent = data.cost > 0
+      ? "Generate for $" + Number(data.cost).toFixed(2)
+      : "Assemble video";
+    renderHold();
+  } catch (err) {
+    if (token !== estimateToken) return;
+    videoQuote = null;
+    document.getElementById("video-estimate").textContent = err.message || "Could not estimate the video.";
+    document.getElementById("video-go").textContent = "Generate";
+  }
 }
 
 function setVideoBusy(locked) {
@@ -1917,6 +2410,9 @@ document.getElementById("video-player").addEventListener("error", () => {
   document.getElementById("video-note").textContent = "The video file is missing.";
 });
 
+document.getElementById("add-cover").addEventListener("click", () => placeEdgeCard("cover"));
+document.getElementById("add-credit").addEventListener("click", () => placeEdgeCard("credit"));
+
 restore();
 refreshFitControls();
 renderLyrics();
@@ -1924,3 +2420,4 @@ renderTimeline();
 renderCast();
 renderStillBin();
 resumeVideo();
+refreshSongLength();

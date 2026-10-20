@@ -40,6 +40,7 @@ KEY_FILE = Path.home() / "Documents" / "API" / "grok-video-pipeline.txt"
 PROJECT_RE = re.compile(r"^[a-f0-9]{8}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.'-]{0,59}$")
 SECTION_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+CARD_ROLES = {"cover", "credit", "fill"}
 STILL_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}\.(jpg|jpeg|png|webp)$")
 MAX_SONG = 80 * 1024 * 1024
 MAX_STILL = 20 * 1024 * 1024
@@ -425,9 +426,30 @@ async def attach_song(project_id: str, file: UploadFile = File(...)):
     return {"project_id": project_id, "song": song_name}
 
 
+async def probed_song_seconds(folder: Path, timeline: dict) -> float:
+    """ffprobe length for the open board. Never written into timeline.json."""
+    raw = str(timeline.get("song_path") or "")
+    if not raw:
+        return 0.0
+    path = Path(raw)
+    if not path.is_file():
+        return 0.0
+    try:
+        path.resolve().relative_to(folder.resolve())
+    except ValueError:
+        return 0.0
+    try:
+        return round(float(await media_duration(path)), 1)
+    except HTTPException:
+        return 0.0
+
+
 @app.get("/api/project/{project_id}")
 async def get_project(project_id: str):
-    return read_timeline(project_folder(project_id))
+    folder = project_folder(project_id)
+    timeline = dict(read_timeline(folder))
+    timeline["duration"] = await probed_song_seconds(folder, timeline)
+    return timeline
 
 
 @app.post("/api/project/{project_id}/timeline")
@@ -437,8 +459,27 @@ async def save_timeline(project_id: str, timeline: dict = Body(...)):
     timeline["id"] = project_id
     timeline["song"] = current.get("song")
     timeline["song_path"] = current.get("song_path")
+    timeline.pop("duration", None)
     if not isinstance(timeline.get("sections"), list):
         timeline["sections"] = []
+    previous_roles = {}
+    for item in current.get("sections") or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        if role in CARD_ROLES and item.get("id"):
+            previous_roles[str(item.get("id"))] = role
+    for item in timeline["sections"]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        if role in CARD_ROLES:
+            item["role"] = role
+            continue
+        item.pop("role", None)
+        kept = previous_roles.get(str(item.get("id") or ""))
+        if kept:
+            item["role"] = kept
     timeline["characters"] = clean_characters(timeline.get("characters"))
     if (folder / "video.mp4").is_file():
         timeline["video"] = f"/api/project/{project_id}/video"
@@ -581,6 +622,9 @@ async def generate_image(project_id: str, section_id: str, body: dict = Body(...
             section["start"] = float(body.get("start") or 0)
         if "end" in body:
             section["end"] = float(body.get("end") or 0)
+        role = str(body.get("role") or "").strip()
+        if role in CARD_ROLES:
+            section["role"] = role
         prompt = compose_prompt(timeline, section)
         if len(prompt.strip()) < 8:
             raise HTTPException(400, "Write a prompt or drop lyrics onto this shot first.")
